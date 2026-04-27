@@ -54,8 +54,12 @@ extension IOResult where T: FixedWidthInteger {
   }
 }
 
-/// An `Error` for an IO operation.
-struct IOError: Error, CustomStringConvertible {
+/// An `Error` for an internal selector syscall.
+///
+/// Internal-only: the public I/O surface uses ``IOError`` (with the typed
+/// `IOOperationKind`); this type is the raw errno carrier the selector
+/// internals throw before the public-API wrapping happens.
+struct POSIXError: Error, CustomStringConvertible {
   let description: String
 
   private enum Error {
@@ -76,7 +80,7 @@ struct IOError: Error, CustomStringConvertible {
     }
   }
 
-  /// Creates a new `IOError``
+  /// Creates a new `POSIXError`.
   ///
   /// - parameters:
   ///     - errorCode: the `errno` that was set for the operation.
@@ -110,7 +114,7 @@ internal func retryingSyscall<T: FixedWidthInteger>(
         return .wouldBlock(0)
       default:
         preconditionIsNotUnacceptableErrno(err: err, where: function)
-        throw IOError(errnoCode: err, reason: function)
+        throw POSIXError(errnoCode: err, reason: function)
       }
     }
     return .processed(res)
@@ -144,7 +148,7 @@ internal func syscallForbiddingEINVAL<T: FixedWidthInteger>(
         return .wouldBlock(0)
       default:
         preconditionIsNotUnacceptableErrnoForbiddingEINVAL(err: err, where: function)
-        throw IOError(errnoCode: err, reason: function)
+        throw POSIXError(errnoCode: err, reason: function)
       }
     }
     return .processed(res)
@@ -170,7 +174,7 @@ func close(descriptor: CInt) throws {
     //     - https://lwn.net/Articles/576478/
     if err != EINTR {
       preconditionIsNotUnacceptableErrnoOnClose(err: err, where: #function)
-      throw IOError(errnoCode: err, reason: "close")
+      throw POSIXError(errnoCode: err, reason: "close")
     }
   }
 }

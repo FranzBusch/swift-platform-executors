@@ -10,8 +10,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-@_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import _Concurrency
-@_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import PlatformExecutors
+import _Concurrency
+@_spi(ExperimentalScheduling) import _Concurrency
+@_spi(ExperimentalCustomExecutors) import _Concurrency
 import Synchronization
 
 // When testing waiting for a delay D, the tests will tolerate a delay

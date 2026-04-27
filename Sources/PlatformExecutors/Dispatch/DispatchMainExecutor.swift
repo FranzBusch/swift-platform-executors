@@ -15,7 +15,7 @@
 @_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import _Concurrency
 
 @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, visionOS 9999, *)
-package class DispatchMainExecutor: MainExecutor, @unchecked Sendable {
+package class DispatchMainExecutor: SerialExecutor, @unchecked Sendable {
   var threaded = false
 
   package init() {}
@@ -26,7 +26,7 @@ package class DispatchMainExecutor: MainExecutor, @unchecked Sendable {
     }
 
     self.threaded = true
-    _dispatchMain()
+    _platformDispatchMain()
   }
 
   package func stop() {
@@ -36,7 +36,7 @@ package class DispatchMainExecutor: MainExecutor, @unchecked Sendable {
   package func enqueue(_ job: consuming ExecutorJob) {
     _dispatchEnqueueMain(
       _Concurrency.UnownedJob(job),
-      serialExecutor: self.asUnownedSerialExecutor()
+      serialExecutor: asUnownedSerialExecutor()
     )
   }
 

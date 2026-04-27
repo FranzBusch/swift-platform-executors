@@ -19,10 +19,8 @@ func compareJobsByPriorityAndSequenceNumber(
   rhs: UnownedJob
 ) -> Bool {
   if lhs.priority == rhs.priority {
-    // If they're the same priority, compare the sequence numbers to
-    // ensure this queue gives stable ordering.  We want the lowest
-    // sequence number first, but note that we want to handle wrapping.
-    let delta = ExecutorJob(lhs).sequenceNumber &- ExecutorJob(rhs).sequenceNumber
+    // sequenceNumber unavailable in this toolchain — fall back to task ID
+    let delta = _getJobTaskId(lhs) &- _getJobTaskId(rhs)
     return (delta >> (UInt.bitWidth - 1)) != 0
   }
   return lhs.priority > rhs.priority

@@ -27,25 +27,98 @@
 import Glibc
 import CPlatformExecutors
 
+/// A monotonic per-fd registration ID, mirrored from
+/// `swift-nio`'s `SelectorRegistrationID` (see
+/// `NIOPosix/SelectorGeneric.swift:409`).
+///
+/// `EpollSelector` allocates a fresh ID at each ``EpollSelector/registerIO(fd:)``
+/// and writes it into the kernel-event payload alongside the file descriptor
+/// (`epoll_event.data.u64`). On every event the dispatch loop validates
+/// `event.registrationID == ioRegistrations[fd]?.registrationID` and discards
+/// stale events for closed-and-reused descriptors. This is the load-bearing
+/// invariant for fd-reuse safety; without it, an in-flight epoll event for a
+/// closed fd can resume the wrong continuation when the kernel hands the same
+/// integer back for a new socket.
+///
+/// Wraparound is acceptable — the disambiguation window is only in-flight
+/// events between `deregisterIO(fd)` and the next `registerIO(fd) → same int`.
+/// `.max` is reserved for the selector's internal eventfd / timerfds; the
+/// allocator never hands it out for I/O fds.
+@available(macOS 14.0, iOS 17.0, watchOS 10.0, tvOS 17.0, *)
+struct SelectorRegistrationID: Hashable, Sendable {
+  var rawValue: UInt32
+
+  init(rawValue: UInt32) {
+    self.rawValue = rawValue
+  }
+
+  /// The reserved ID for the selector's internal fds (eventfd, timerfds).
+  static let reservedForInternalFDs = SelectorRegistrationID(rawValue: .max)
+}
+
+extension SelectorRegistrationID {
+  /// Allocates the next ID, skipping `.max` (reserved).
+  fileprivate static func nextID(_ counter: inout UInt32) -> SelectorRegistrationID {
+    let issued = counter
+    counter &+= 1
+    if counter == UInt32.max {
+      // .max is reserved for the selector's internal fds — skip past it.
+      counter &+= 1
+    }
+    return SelectorRegistrationID(rawValue: issued)
+  }
+}
+
 /// A selector that uses epoll for eventing
 @available(macOS 14.0, iOS 17.0, watchOS 10.0, tvOS 17.0, *)
 struct EpollSelector: ~Copyable {
   /// User data supports (un)packing into an `UInt64` because epoll has a user info field that we can attach which is
-  /// up to 64 bits wide. We're using all of those 64 bits, 32 for a "registration ID" and 32 for the file descriptor.
+  /// up to 64 bits wide. We're using all of those 64 bits, 32 for a "registration ID" and 32 for the file handle.
   struct UserData {
-    var registrationID: UInt32
-    var fileDescriptor: CInt
+    var registrationID: SelectorRegistrationID
+    var fileHandle: CInt
 
-    init(registrationID: UInt32, fileDescriptor: CInt) {
+    init(registrationID: SelectorRegistrationID, fileHandle: CInt) {
       assert(MemoryLayout<UInt64>.size == MemoryLayout<UserData>.size)
       self.registrationID = registrationID
-      self.fileDescriptor = fileDescriptor
+      self.fileHandle = fileHandle
     }
 
     init(rawValue: UInt64) {
       let unpacked = IntegerBitPacking.unpackUInt32CInt(rawValue)
-      self = .init(registrationID: unpacked.0, fileDescriptor: unpacked.1)
+      self = .init(
+        registrationID: SelectorRegistrationID(rawValue: unpacked.0),
+        fileHandle: unpacked.1
+      )
     }
+  }
+
+  /// A pending I/O submission against a registered fd.
+  ///
+  /// Submissions queue per-fd / per-direction in
+  /// ``IORegistration/pendingReads`` / ``IORegistration/pendingWrites``.
+  /// On readiness, the head of the matching queue is dequeued and its
+  /// continuation is resumed via the public ``IOError`` channel.
+  struct PendingIO {
+    /// A monotonic per-`PThreadExecutor` submission id. Used by the
+    /// task-cancellation path to find this exact submission inside its
+    /// per-fd queue, even when several submissions share the fd/direction.
+    var submissionID: UInt64
+    var operation: LoweredIOOperation
+    var continuation: UnsafeContinuation<IOOperationResult, IOError>
+  }
+
+  /// Per-fd registration state.
+  ///
+  /// `registrationID` is the fd-reuse disambiguator (see
+  /// ``SelectorRegistrationID``). `pendingReads`/`pendingWrites` are FIFO
+  /// queues — multiple concurrent reads (or writes) on the same fd
+  /// complete in submission order, fixing the M1-S1.0/F3 single-slot
+  /// overwrite hazard.
+  struct IORegistration {
+    var registrationID: SelectorRegistrationID
+    var pendingReads: ContiguousArray<PendingIO> = []
+    var pendingWrites: ContiguousArray<PendingIO> = []
   }
 
   /// The selector file descriptor.
@@ -60,6 +133,10 @@ struct EpollSelector: ~Copyable {
   fileprivate var nextMonotonicClockTimer: ContinuousClock.Instant?
   /// The next suspending clock timer to avoid re-arming the timer if possible.
   fileprivate var nextBoottimelockTimer: SuspendingClock.Instant?
+  /// Registered I/O file descriptors and their pending operations.
+  var ioRegistrations: [CInt: IORegistration] = [:]
+  /// Allocator state for ``SelectorRegistrationID``.
+  fileprivate var nextRegistrationIDCounter: UInt32 = 0
 
   init() throws {
     // We try! all of these since if the creation fails there is nothing we can do to recover.
@@ -81,8 +158,8 @@ struct EpollSelector: ~Copyable {
     ev.events = Epoll.EPOLLERR | Epoll.EPOLLHUP | Epoll.EPOLLIN
     ev.data.u64 = UInt64(
       UserData(
-        registrationID: .max,
-        fileDescriptor: self.eventFD
+        registrationID: .reservedForInternalFDs,
+        fileHandle: self.eventFD
       )
     )
     try Epoll.epoll_ctl(
@@ -96,8 +173,8 @@ struct EpollSelector: ~Copyable {
     monotonicTimerev.events = Epoll.EPOLLIN | Epoll.EPOLLERR | Epoll.EPOLLRDHUP
     monotonicTimerev.data.u64 = UInt64(
       UserData(
-        registrationID: .max,
-        fileDescriptor: self.monotonicTimerFD
+        registrationID: .reservedForInternalFDs,
+        fileHandle: self.monotonicTimerFD
       )
     )
     try Epoll.epoll_ctl(
@@ -111,8 +188,8 @@ struct EpollSelector: ~Copyable {
     boottimeTimerev.events = Epoll.EPOLLIN | Epoll.EPOLLERR | Epoll.EPOLLRDHUP
     boottimeTimerev.data.u64 = UInt64(
       UserData(
-        registrationID: .max,
-        fileDescriptor: self.boottimeTimerFD
+        registrationID: .reservedForInternalFDs,
+        fileHandle: self.boottimeTimerFD
       )
     )
     try Epoll.epoll_ctl(
@@ -140,8 +217,8 @@ struct EpollSelector: ~Copyable {
   mutating func whenReady(
     strategy: SelectorStrategy
   ) throws {
-    // Right now we only handle three events at most: EventFD and two TimerFDs
-    let maxEvents = 3
+    // Handle up to 64 events: 3 internal + external I/O FDs
+    let maxEvents = 64
 
     try withUnsafeTemporaryAllocation(of: Epoll.epoll_event.self, capacity: maxEvents) { eventsPointer in
       let readyEvents: Int
@@ -205,8 +282,8 @@ struct EpollSelector: ~Copyable {
       for i in 0..<readyEvents {
         let ev = eventsPointer[i]
         let epollUserData = UserData(rawValue: ev.data.u64)
-        let fd = epollUserData.fileDescriptor
-        _ = epollUserData.registrationID
+        let fd = epollUserData.fileHandle
+        let eventRegistrationID = epollUserData.registrationID
         switch fd {
         case self.eventFD:
           // Consume event
@@ -237,7 +314,27 @@ struct EpollSelector: ~Copyable {
           // Processed the earliest set timer so reset it.
           self.nextBoottimelockTimer = nil
         default:
-          fatalError("Unknown file descriptor in epoll event")
+          guard let registration = self.ioRegistrations[fd] else {
+            // The fd was deregistered while events were in flight; ignore.
+            continue
+          }
+          // fd-reuse safety: discard events for a stale generation.
+          // See `SelectorRegistrationID` and SNW-0001 §"fd-reuse safety".
+          guard registration.registrationID == eventRegistrationID else {
+            continue
+          }
+
+          let isReadable = ev.events & Epoll.EPOLLIN != 0
+            || ev.events & Epoll.EPOLLHUP != 0
+            || ev.events & Epoll.EPOLLERR != 0
+          let isWritable = ev.events & Epoll.EPOLLOUT != 0
+
+          if isReadable {
+            self.completeNextOperation(fd: fd, direction: .read)
+          }
+          if isWritable {
+            self.completeNextOperation(fd: fd, direction: .write)
+          }
         }
       }
     }
@@ -246,6 +343,305 @@ struct EpollSelector: ~Copyable {
   /// Wakes up the selector.
   func wakeup() throws {
     _ = try EventFileDescriptor.eventfd_write(fd: self.eventFD, value: 1)
+  }
+
+  // MARK: - I/O operation submission
+
+  /// Registers a file descriptor for I/O event monitoring.
+  ///
+  /// Allocates a fresh ``SelectorRegistrationID`` for this `(fd,
+  /// generation)` and writes it into the kernel-event payload. Subsequent
+  /// `EPOLL_CTL_MOD` calls for this fd carry the same ID until
+  /// ``deregisterIO(fd:)`` issues a new generation.
+  mutating func registerIO(fd: CInt) throws {
+    let id = SelectorRegistrationID.nextID(&self.nextRegistrationIDCounter)
+    var ev = Epoll.epoll_event()
+    ev.events = Epoll.EPOLLET
+    ev.data.u64 = UInt64(UserData(registrationID: id, fileHandle: fd))
+    try Epoll.epoll_ctl(
+      epfd: self.selectorFD,
+      op: Epoll.EPOLL_CTL_ADD,
+      fd: fd,
+      event: &ev
+    )
+    ioRegistrations[fd] = IORegistration(registrationID: id)
+  }
+
+  /// Submits an I/O operation for completion.
+  ///
+  /// Appends the submission to the per-fd / per-direction queue and re-arms
+  /// the epoll interest mask to include the relevant filter (`EPOLLIN` for
+  /// read/accept/close-drain, `EPOLLOUT` for write/connect). When the fd
+  /// becomes ready, ``whenReady(strategy:)`` pops the head of the matching
+  /// queue and invokes the completion syscall on the executor thread,
+  /// resuming the continuation with the result.
+  ///
+  /// Fail-by-resume: if the `epoll_ctl(MOD)` fails, the entry is dequeued
+  /// and the continuation resumes with the typed POSIX error rather than
+  /// trapping at the call site (M1-S1.0/F4).
+  mutating func submit(
+    _ operation: LoweredIOOperation,
+    submissionID: UInt64,
+    continuation: UnsafeContinuation<IOOperationResult, IOError>
+  ) {
+    let fd = operation.fileHandle
+    let direction = operation.direction
+
+    guard var registration = ioRegistrations[fd] else {
+      // Submitted against a non-registered fd. Surface a typed POSIX error.
+      continuation.resume(throwing: .posix(errno: EBADF, operation: operation.kind))
+      return
+    }
+
+    let pending = PendingIO(
+      submissionID: submissionID,
+      operation: operation,
+      continuation: continuation
+    )
+
+    switch direction {
+    case .read:
+      registration.pendingReads.append(pending)
+    case .write:
+      registration.pendingWrites.append(pending)
+    }
+    ioRegistrations[fd] = registration
+
+    do {
+      try self.armInterestMask(fd: fd, registration: registration)
+    } catch let err as POSIXError {
+      // Fail-by-resume — pop the entry we just pushed and resume with the
+      // typed error instead of trapping inside the continuation closure.
+      if var rollback = ioRegistrations[fd] {
+        switch direction {
+        case .read:
+          if !rollback.pendingReads.isEmpty {
+            _ = rollback.pendingReads.removeLast()
+          }
+        case .write:
+          if !rollback.pendingWrites.isEmpty {
+            _ = rollback.pendingWrites.removeLast()
+          }
+        }
+        ioRegistrations[fd] = rollback
+      }
+      continuation.resume(throwing: .posix(errno: err.errnoCode, operation: operation.kind))
+    } catch {
+      continuation.resume(throwing: .backend(error))
+    }
+  }
+
+  /// Cancels a pending submission identified by `submissionID`.
+  ///
+  /// Walks the per-fd queue in `direction`, removes the matching entry,
+  /// and resumes its continuation with
+  /// ``IOError/cancelled(transferred:)``. Returns `true` if a matching
+  /// entry was found and resumed; `false` if the submission had already
+  /// completed (lost the cancel race).
+  @discardableResult
+  mutating func cancelSubmission(
+    fd: CInt,
+    direction: PendingDirection,
+    submissionID: UInt64
+  ) -> Bool {
+    guard var registration = ioRegistrations[fd] else { return false }
+    let removed: PendingIO?
+    switch direction {
+    case .read:
+      if let idx = registration.pendingReads.firstIndex(where: { $0.submissionID == submissionID }) {
+        removed = registration.pendingReads.remove(at: idx)
+      } else {
+        removed = nil
+      }
+    case .write:
+      if let idx = registration.pendingWrites.firstIndex(where: { $0.submissionID == submissionID }) {
+        removed = registration.pendingWrites.remove(at: idx)
+      } else {
+        removed = nil
+      }
+    }
+    ioRegistrations[fd] = registration
+    if let removed {
+      removed.continuation.resume(throwing: .cancelled(transferred: 0))
+      return true
+    }
+    return false
+  }
+
+  /// Builds and applies the epoll interest mask reflecting `registration`'s
+  /// current per-fd queues. `EPOLLIN` is set if `pendingReads` is non-empty,
+  /// `EPOLLOUT` if `pendingWrites` is non-empty.
+  private mutating func armInterestMask(
+    fd: CInt,
+    registration: IORegistration
+  ) throws {
+    var ev = Epoll.epoll_event()
+    ev.events = Epoll.EPOLLET | Epoll.EPOLLHUP | Epoll.EPOLLERR
+    if !registration.pendingReads.isEmpty {
+      ev.events |= Epoll.EPOLLIN
+    }
+    if !registration.pendingWrites.isEmpty {
+      ev.events |= Epoll.EPOLLOUT
+    }
+    ev.data.u64 = UInt64(
+      UserData(registrationID: registration.registrationID, fileHandle: fd)
+    )
+    try Epoll.epoll_ctl(
+      epfd: self.selectorFD,
+      op: Epoll.EPOLL_CTL_MOD,
+      fd: fd,
+      event: &ev
+    )
+  }
+
+  /// Deregisters a file descriptor from I/O monitoring and drains its
+  /// pending submissions.
+  ///
+  /// Every queued submission resumes with
+  /// ``IOError/fileHandleClosed(operation:)`` carrying the operation's
+  /// kind. After deregistration the next `registerIO(fd:)` for the same
+  /// integer (e.g. after `close(2)` and a fresh `socket(2)` returns the
+  /// reused fd) gets a new ``SelectorRegistrationID``, so any stale epoll
+  /// events that arrive for the old generation are silently dropped by the
+  /// dispatch loop.
+  mutating func deregisterIO(fd: CInt) {
+    if let registration = ioRegistrations.removeValue(forKey: fd) {
+      for pending in registration.pendingReads {
+        pending.continuation.resume(
+          throwing: .fileHandleClosed(operation: pending.operation.kind)
+        )
+      }
+      for pending in registration.pendingWrites {
+        pending.continuation.resume(
+          throwing: .fileHandleClosed(operation: pending.operation.kind)
+        )
+      }
+    }
+    var ev = Epoll.epoll_event()
+    _ = try? Epoll.epoll_ctl(
+      epfd: self.selectorFD,
+      op: Epoll.EPOLL_CTL_DEL,
+      fd: fd,
+      event: &ev
+    )
+  }
+
+  // MARK: - Operation completion (performs syscall on readiness)
+
+  /// Pops the head submission from the appropriate per-fd queue and runs
+  /// its completion syscall. Re-arms the interest mask if the queue still
+  /// has remaining entries.
+  private mutating func completeNextOperation(fd: CInt, direction: PendingDirection) {
+    guard var registration = ioRegistrations[fd] else { return }
+    let pending: PendingIO?
+    switch direction {
+    case .read:
+      pending = registration.pendingReads.isEmpty ? nil : registration.pendingReads.removeFirst()
+    case .write:
+      pending = registration.pendingWrites.isEmpty ? nil : registration.pendingWrites.removeFirst()
+    }
+    ioRegistrations[fd] = registration
+
+    guard let pending else { return }
+
+    switch direction {
+    case .read:
+      self.completeReadOperation(pending)
+    case .write:
+      self.completeWriteOperation(pending)
+    }
+
+    // Re-arm if the queue still has more work; otherwise the next submit
+    // will arm the mask itself.
+    if let updated = ioRegistrations[fd] {
+      let stillHasReads = !updated.pendingReads.isEmpty
+      let stillHasWrites = !updated.pendingWrites.isEmpty
+      if stillHasReads || stillHasWrites {
+        // Best-effort re-arm. If this fails the next event loop iteration
+        // simply doesn't deliver the event; submits land on the same path
+        // and would re-arm then.
+        _ = try? self.armInterestMask(fd: fd, registration: updated)
+      }
+    }
+  }
+
+  private func completeReadOperation(_ pending: PendingIO) {
+    switch pending.operation {
+    case .read(let fd, let buffer):
+      while true {
+        let bytesRead = Glibc.read(fd, buffer.baseAddress, buffer.count)
+        if bytesRead >= 0 {
+          pending.continuation.resume(returning: .read(bytesRead: bytesRead))
+          return
+        }
+        if errno == EINTR { continue }
+        pending.continuation.resume(throwing: .posix(errno: errno, operation: .read))
+        return
+      }
+    case .accept(let fd):
+      while true {
+        var addr = sockaddr_storage()
+        var addrLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let result = withUnsafeMutablePointer(to: &addr) { addrPtr in
+          addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+            Glibc.accept(fd, sa, &addrLen)
+          }
+        }
+        if result >= 0 {
+          let flags = fcntl(result, F_GETFL)
+          _ = fcntl(result, F_SETFL, flags | O_NONBLOCK)
+          pending.continuation.resume(
+            returning: .accept(acceptedFileHandle: result, peer: addr, peerLength: addrLen)
+          )
+          return
+        }
+        if errno == EINTR { continue }
+        pending.continuation.resume(throwing: .posix(errno: errno, operation: .accept))
+        return
+      }
+    case .close(let fd):
+      // Close is "drain pending then issue close" — by the time we get
+      // here the queue drain already happened in `deregisterIO`. We just
+      // run the syscall and resume.
+      let result = Glibc.close(fd)
+      if result == 0 {
+        pending.continuation.resume(returning: .close)
+      } else {
+        pending.continuation.resume(throwing: .posix(errno: errno, operation: .close))
+      }
+    default:
+      pending.continuation.resume(throwing: .unsupportedOperation(operation: pending.operation.kind))
+    }
+  }
+
+  private func completeWriteOperation(_ pending: PendingIO) {
+    switch pending.operation {
+    case .write(let fd, let buffer, let offset):
+      while true {
+        let remaining = buffer.count - offset
+        let written = unsafe Glibc.write(
+          fd, buffer.baseAddress! + offset, remaining
+        )
+        if written >= 0 {
+          pending.continuation.resume(returning: .write(bytesWritten: written))
+          return
+        }
+        if errno == EINTR { continue }
+        pending.continuation.resume(throwing: .posix(errno: errno, operation: .write))
+        return
+      }
+    case .connect(let fd, _, _):
+      var soError: CInt = 0
+      var soErrorLen = socklen_t(MemoryLayout<CInt>.size)
+      _ = getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &soErrorLen)
+      if soError == 0 {
+        pending.continuation.resume(returning: .connect)
+      } else {
+        pending.continuation.resume(throwing: .posix(errno: soError, operation: .connect))
+      }
+    default:
+      pending.continuation.resume(throwing: .unsupportedOperation(operation: pending.operation.kind))
+    }
   }
 
   @inline(never)
@@ -340,9 +736,9 @@ private struct EpollFilterSet: OptionSet, Equatable {
 
 extension UInt64 {
   init(_ epollUserData: EpollSelector.UserData) {
-    let fd = epollUserData.fileDescriptor
+    let fd = epollUserData.fileHandle
     assert(fd >= 0, "\(fd) is not a valid file descriptor")
-    self = IntegerBitPacking.packUInt32CInt(epollUserData.registrationID, fd)
+    self = IntegerBitPacking.packUInt32CInt(epollUserData.registrationID.rawValue, fd)
   }
 }
 #endif

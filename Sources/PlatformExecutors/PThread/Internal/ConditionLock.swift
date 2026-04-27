@@ -36,7 +36,7 @@ import Musl
 #error("The concurrency lock module was unable to identify your C library.")
 #endif
 
-final class ConditionVariable<Value: ~Copyable> {
+final class ConditionVariable<Value: ~Copyable>: @unchecked Sendable {
   #if os(Windows)
   typealias LockType = SRWLOCK
   typealias ConditionVariableType = CONDITION_VARIABLE

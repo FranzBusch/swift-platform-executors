@@ -112,7 +112,7 @@ private func getGlobalQueue(for priority: JobPriority) -> DispatchQueue {
 // MARK: - Public Runtime Methods
 
 @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, visionOS 9999, *)
-internal func _dispatchMain() -> Never {
+internal func _platformDispatchMain() -> Never {
   CPlatformExecutors_dispatchMain()
 }
 

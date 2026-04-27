@@ -11,7 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #if os(Linux) || os(Android) || os(FreeBSD) || canImport(Darwin)
-@_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import _Concurrency
+
+@_spi(ExperimentalScheduling) import _Concurrency
 /// A serial executor that provides serial execution by spawning a new thread.
 ///
 /// ## Usage
@@ -103,22 +104,22 @@ public final class PThreadSerialExecutor: SerialExecutor, @unchecked Sendable {
   }
 }
 
-#if !canImport(Darwin)
-@_spi(ExperimentalScheduling) extension PThreadSerialExecutor: SchedulingExecutor {
-  @_spi(ExperimentalScheduling) public var asSchedulingExecutor: SchedulingExecutor? {
-    return self
-  }
-
-  public func enqueue<C: Clock>(
-    _ job: consuming ExecutorJob,
-    at instant: C.Instant,
-    tolerance: C.Duration?,
-    clock: C
-  ) {
-    self.pThreadExecutor.enqueue(job, at: instant, tolerance: tolerance, clock: clock)
-  }
-}
-#endif
+// #if !canImport(Darwin)
+// extension PThreadSerialExecutor: SchedulingExecutor {
+//   public var asSchedulingExecutor: SchedulingExecutor? {
+//     return self
+//   }
+//
+//   public func enqueue<C: Clock>(
+//     _ job: consuming ExecutorJob,
+//     at instant: C.Instant,
+//     tolerance: C.Duration?,
+//     clock: C
+//   ) {
+//     self.pThreadExecutor.enqueue(job, at: instant, tolerance: tolerance, clock: clock)
+//   }
+// }
+// #endif
 
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 extension PThreadSerialExecutor: CustomStringConvertible {

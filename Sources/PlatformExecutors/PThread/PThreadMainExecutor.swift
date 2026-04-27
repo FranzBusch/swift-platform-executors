@@ -11,7 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #if os(Linux) || os(Android) || os(FreeBSD) || canImport(Darwin)
-@_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import _Concurrency
+
+@_spi(ExperimentalScheduling) import _Concurrency
+@_spi(ExperimentalCustomExecutors) import _Concurrency
+
 /// A main executor that provides serial execution by taking over the current thread.
 ///
 /// ## Usage
@@ -26,54 +29,42 @@
 /// // Stop the executor from another context
 /// mainExecutor.stop()
 /// ```
+@_spi(ExperimentalCustomExecutors)
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-package final class PThreadMainExecutor: SerialExecutor, @unchecked Sendable {
+public final class PThreadMainExecutor: SerialExecutor, MainExecutor, @unchecked Sendable {
   private let pThreadExecutor: PThreadExecutor!
 
   /// Creates a new `PThreadMainExecutor` that takes control of the current thread.
-  package init() {
+  public init() {
     self.pThreadExecutor = PThreadExecutor()
   }
 
-  package func enqueue(_ job: UnownedJob) {
+  public func enqueue(_ job: UnownedJob) {
     self.pThreadExecutor.enqueue(job)
   }
 
-  package func run() throws {
+  public func run() throws {
     // We are taking over the current thread
     try self.pThreadExecutor.run { job in
       job.runSynchronously(on: self.asUnownedSerialExecutor())
     }
   }
 
-  package func stop() {
+  public func runUntil(_ condition: () -> Bool) throws {
+    // Not needed for server use — just run until stopped
+    try self.run()
+  }
+
+  public func stop() {
     // We are not waiting on the condition variable since it would result in a
     // dead lock due to us taking over the thread previously.
     _ = self.pThreadExecutor.stop()
   }
 }
 
-#if !canImport(Darwin)
-extension PThreadMainExecutor: MainExecutor {}
-extension PThreadMainExecutor: SchedulingExecutor {
-  package var asSchedulingExecutor: SchedulingExecutor? {
-    return self
-  }
-
-  package func enqueue<C: Clock>(
-    _ job: consuming ExecutorJob,
-    at instant: C.Instant,
-    tolerance: C.Duration?,
-    clock: C
-  ) {
-    self.pThreadExecutor.enqueue(job, at: instant, tolerance: tolerance, clock: clock)
-  }
-}
-#endif
-
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 extension PThreadMainExecutor: CustomStringConvertible {
-  package var description: String {
+  public var description: String {
     "PThreadMainExecutor(\(self.pThreadExecutor.threadDescription))"
   }
 }

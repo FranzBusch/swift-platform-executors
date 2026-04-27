@@ -13,8 +13,8 @@
 #if os(Linux) || os(FreeBSD) || canImport(Darwin)
 
 import Testing
-@_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import _Concurrency
-@_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import PlatformExecutors
+import PlatformExecutors
+@_spi(ExperimentalCustomExecutors) import PlatformExecutors
 
 @Suite
 struct PThreadExecutorTests {

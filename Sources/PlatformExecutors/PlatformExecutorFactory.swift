@@ -10,57 +10,19 @@
 //
 //===----------------------------------------------------------------------===//
 
-@_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import _Concurrency
-
 #if os(Windows)
-/// Provides a reasonable default executor factory for your platform.
-@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, visionOS 9999, *)
-@_spi(ExperimentalCustomExecutors) public struct PlatformExecutorFactory: ExecutorFactory {
-  @_spi(ExperimentalCustomExecutors) public static let mainExecutor: any MainExecutor = Win32EventLoopExecutor(
-    isMainExecutor: true
-  )
-  public static let defaultExecutor: any TaskExecutor = Win32ThreadPoolExecutor()
-
-  /// Creates a new platform-native task executor.
-  ///
-  /// - Parameters:
-  ///   - name: The base name for the executor.
-  ///   - poolSize: The suggested number internal executors in the pool. Must be greater than 0.
-  ///   Defaults to `nil` which uses a reasonable platform default.
-  ///   - body: A closure that gets access to the task executor for the duration of the closure.
-  public nonisolated(nonsending) static func withTaskExecutor<Return, Failure: Error>(
-    name: String,
-    poolSize: Int? = nil,
-    body: (PlatformTaskExecutor) async throws(Failure) -> Return
-  ) async throws(Failure) -> Return {
-    let platformExecutor = PlatformTaskExecutor()
-    if let poolSize {
-      platformExecutor.executor = Win32ThreadPoolExecutor(poolSize: poolSize)
-    } else {
-      platformExecutor.executor = Win32ThreadPoolExecutor()
-    }
-    return try await body(platformExecutor)
-  }
-
-  /// Creates a new platform-native serial executor .
-  ///
-  /// - Parameters:
-  ///   - name: The base name for the executor.
-  ///   - body: A closure that gets access to the serial executor for the duration of the closure.
-  public nonisolated(nonsending) static func withSerialExecutor<Return, Failure: Error>(
-    name: String,
-    body: (PlatformSerialExecutor) async throws(Failure) -> Return
-  ) async throws(Failure) -> Return {
-    let platformExecutor = PlatformSerialExecutor()
-    platformExecutor.executor = Win32ThreadPoolExecutor(poolSize: 1)
-    return try await body(platformExecutor)
-  }
-}
+// /// Provides a reasonable default executor factory for your platform.
+// @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, visionOS 9999, *)
+// public struct PlatformExecutorFactory: ExecutorFactory {
+//   public static let mainExecutor: any MainExecutor = Win32EventLoopExecutor(isMainExecutor: true)
+//   public static let defaultExecutor: any TaskExecutor = Win32ThreadPoolExecutor()
+// ...
+// }
 #elseif canImport(Darwin)
 /// Provides a reasonable default executor factory for your platform.
 @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, visionOS 9999, *)
-@_spi(ExperimentalCustomExecutors) public struct PlatformExecutorFactory: ExecutorFactory {
-  @_spi(ExperimentalCustomExecutors) public static let mainExecutor: any MainExecutor = DispatchMainExecutor()
+public struct PlatformExecutorFactory { // : ExecutorFactory
+  // public static let mainExecutor: any MainExecutor = DispatchMainExecutor()
   public static let defaultExecutor: any TaskExecutor = DispatchGlobalTaskExecutor()
 
   /// Creates a new platform-native task executor.
@@ -114,8 +76,8 @@ import Foundation
 /// On Linux this takes into account C1 and C2 group restrictions. Additionally, the size can be customized
 /// by setting the `SWIFT_PLATFORM_DEFAULT_EXECUTOR_POOL_SIZE` environment variable.
 @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, visionOS 9999, *)
-@_spi(ExperimentalCustomExecutors) public struct PlatformExecutorFactory: ExecutorFactory {
-  @_spi(ExperimentalCustomExecutors) public static let mainExecutor: any MainExecutor = PThreadMainExecutor()
+public struct PlatformExecutorFactory { // : ExecutorFactory
+  // public static let mainExecutor: any MainExecutor = PThreadMainExecutor()
   public static let defaultExecutor: any TaskExecutor = {
     let coreCountEnvironment = ProcessInfo.processInfo
       .environment["SWIFT_PLATFORM_DEFAULT_EXECUTOR_POOL_SIZE"]

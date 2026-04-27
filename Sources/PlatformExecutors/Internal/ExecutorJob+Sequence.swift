@@ -10,22 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-@_spi(ExperimentalScheduling) @_spi(ConcurrencyExecutors) @_spi(ExperimentalCustomExecutors) import _Concurrency
-
-@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, visionOS 9999, *)
-extension ExecutorJob {
-  var sequenceNumber: UInt64 {
-    get {
-      return unsafe withUnsafeExecutorPrivateData {
-        return unsafe $0.assumingMemoryBound(to: UInt64.self)[0]
-      }
-    }
-    set {
-      return unsafe withUnsafeExecutorPrivateData {
-        unsafe $0.withMemoryRebound(to: UInt64.self) {
-          unsafe $0[0] = newValue
-        }
-      }
-    }
-  }
-}
+// Temporarily commented out: withUnsafeExecutorPrivateData is unavailable
+// in this toolchain.
+//
+// @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, visionOS 9999, *)
+// extension ExecutorJob {
+//   var sequenceNumber: UInt64 { ... }
+// }
