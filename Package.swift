@@ -31,7 +31,7 @@ let package = Package(
   ],
   dependencies: [
     .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0"),
-    .package(url: "https://github.com/apple/swift-collections", branch: "fb-async" , traits: ["UnstableContainersPreview"]),
+    .package(url: "https://github.com/FranzBusch/swift-collections", branch: "fb-async" , traits: ["UnstableContainersPreview"]),
   ],
   targets: [
     .target(
