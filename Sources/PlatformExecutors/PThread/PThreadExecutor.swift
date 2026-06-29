@@ -481,6 +481,25 @@ package final class PThreadExecutor: TaskExecutor, @unchecked Sendable {
       // Process any I/O cancellation requests before running jobs.
       // This ensures a stale cancellation can never affect a newer wait,
       // because the task that would register the newer wait hasn't run yet.
+      //
+      // **Keep-on-no-match (S1.7.1).** A cancellation whose target submission
+      // has not yet been pushed to the per-fd queue returns `false` from
+      // `cancelSubmission`. We must NOT drop it: the submit body may run
+      // later (after a yield between `withTaskCancellationHandler`'s handler
+      // install and the `withUnsafeThrowingContinuation` closure body, or
+      // when the wTCH body resumes on a different executor). The unmatched
+      // notice stays in `pendingIOCancellations` so a subsequent reconcile
+      // pass — triggered by the submit body's own `wakeup()` after it
+      // pushes — can match it. Without this, the cancellation is lost and
+      // the eventual submit pushes a non-cancellable entry that hangs
+      // forever.
+      //
+      // Bounded waste in the Case 4 race (cancel arrives after the kernel
+      // has resumed the continuation successfully but before wTCH's defer
+      // removes the handler record): the notice never matches; reconcile
+      // re-appends it every pass. Cost per leak is ~10 ns (a `firstIndex`
+      // over the typically-empty per-fd deques); real-world rate of Case 4
+      // is essentially zero (microsecond-scale window).
       let cancellations = self._multiThreadedState.withLock { state -> ContiguousArray<PendingIOCancellation> in
         guard !state.pendingIOCancellations.isEmpty else {
           return []
@@ -489,12 +508,21 @@ package final class PThreadExecutor: TaskExecutor, @unchecked Sendable {
         state.pendingIOCancellations.removeAll(keepingCapacity: true)
         return result
       }
+      var unmatchedCancellations: ContiguousArray<PendingIOCancellation> = []
       for cancellation in cancellations {
-        self._threadBoundState.selector.cancelSubmission(
+        let matched = self._threadBoundState.selector.cancelSubmission(
           fd: cancellation.fd,
           direction: cancellation.direction,
           submissionID: cancellation.submissionID
         )
+        if !matched {
+          unmatchedCancellations.append(cancellation)
+        }
+      }
+      if !unmatchedCancellations.isEmpty {
+        self._multiThreadedState.withLock {
+          $0.pendingIOCancellations.append(contentsOf: unmatchedCancellations)
+        }
       }
 
       // Our selector unblocked and we are going to pop some jobs

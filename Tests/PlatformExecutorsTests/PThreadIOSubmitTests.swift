@@ -339,6 +339,49 @@ struct PThreadIOSubmitTests {
     }
   }
 
+  // MARK: S1.7.1 — cancellation before submit pushes does not hang
+
+  /// A read submitted on a registered-but-quiet fd must observe
+  /// `IOError.cancelled` when its task is cancelled before the submit
+  /// closure has pushed the entry onto the per-fd queue.
+  ///
+  /// Without the run-loop fix, the cancel handler appends the
+  /// cancellation notice and wakes the selector; the run loop's
+  /// reconcile pass calls `cancelSubmission(...)` which returns false
+  /// (the per-fd queue is empty — submit hasn't pushed yet); the
+  /// dropped notice means the eventual submit pushes a non-cancellable
+  /// entry and the read hangs forever. With the fix the notice is
+  /// retained across reconcile passes until submit pushes, at which
+  /// point the next pass matches and resumes the continuation with
+  /// `IOError.cancelled`.
+  @Test
+  @available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, visionOS 26.0, *)
+  func cancellationBeforeSubmitDoesNotHang() async throws {
+    try await withIOExecutor { executor in
+      let pair = try await makeLoopbackPair(executor: executor)
+
+      do {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+          group.addTask {
+            // Read on the registered-but-quiet server end. The peer never
+            // writes, so without cancellation this hangs forever.
+            try await executor.read(fileHandle: pair.serverFD) { _ in () }
+          }
+          group.cancelAll()
+          try await group.waitForAll()
+        }
+        Issue.record("expected IOError.cancelled, got success")
+      } catch let error as IOError {
+        #expect(error.code == .cancelled)
+      } catch {
+        Issue.record("expected IOError, got \(type(of: error)): \(error)")
+      }
+
+      try await executor.close(fileHandle: pair.clientFD)
+      try await executor.close(fileHandle: pair.serverFD)
+    }
+  }
+
   // MARK: Caller-owned read into a non-UniqueArray RangeReplaceableContainer
 
   /// Exercises the generic `read(into:)` against a different
