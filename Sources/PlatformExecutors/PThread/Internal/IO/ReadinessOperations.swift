@@ -361,6 +361,21 @@ struct ReadinessOperations: ~Copyable {
     }
   }
 
+  /// The registration that the operations of a file descriptor.
+  ///
+  /// - Parameter fileDescriptor: The file descriptor to return the registration of.
+  /// - Returns: The registration to arm, or `nil` if nothing waits on the file descriptor anymore.
+  func registration(for fileDescriptor: CInt) -> Registration? {
+    guard let pending = self.pendingOperations[fileDescriptor] else {
+      return nil
+    }
+    return Registration(
+      fileDescriptor: fileDescriptor,
+      interest: pending.interest,
+      registrationID: pending.registrationID
+    )
+  }
+
   /// Returns the identifier for a new registration.
   private mutating func makeRegistrationID() -> UInt32 {
     let id = self.nextRegistrationID

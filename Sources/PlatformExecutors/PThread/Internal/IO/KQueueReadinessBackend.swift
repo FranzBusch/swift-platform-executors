@@ -157,79 +157,82 @@ struct KQueueReadinessBackend: ~Copyable {
   ///
   /// - Parameters:
   ///   - strategy: The strategy to use for blocking.
-  ///   - onEvent: The closure called for every registered file descriptor that became ready.
-  private mutating func whenReady(
+  ///   - events: The buffer that kqueue writes the events into. It has to be empty.
+  private mutating func waitForEvents(
     strategy: IOWaitStrategy,
-    onEvent: (ReadinessEvent) -> Void = { _ in }
+    into events: inout OutputSpan<Darwin.kevent>
   ) throws {
     self.appendTimerChanges(strategy: strategy)
 
     let timespec = Self.toKQueueTimeSpec(strategy: strategy)
 
-    let maxEvents = Self.maxEvents
-    try withUnsafeTemporaryAllocation(of: Darwin.kevent.self, capacity: maxEvents) { eventsPointer in
-      let readyEvents = try timespec.withUnsafeOptionalPointer { ts in
+    try events.withUnsafeMutableBufferPointer { buffer, initializedCount in
+      assert(initializedCount == 0, "The events can only be written into an empty buffer")
+      initializedCount = try timespec.withUnsafeOptionalPointer { ts in
         try self.pendingChanges.withUnsafeBufferPointer { changelist in
           Int(
             try Self.kevent(
               kq: self.kqueueFD,
               changelist: changelist.baseAddress,
               nchanges: CInt(changelist.count),
-              eventlist: eventsPointer.baseAddress!,
-              nevents: CInt(maxEvents),
+              eventlist: buffer.baseAddress!,
+              nevents: CInt(buffer.count),
               timeout: ts
             )
           )
         }
       }
-      // The kernel has taken the changes, so we can clear the array.
-      self.pendingChanges.removeAll(keepingCapacity: true)
+    }
+    // The kernel has taken the changes, so we can clear the array.
+    self.pendingChanges.removeAll(keepingCapacity: true)
+  }
 
-      // Process the ready events
-      for i in 0..<readyEvents {
-        let event = eventsPointer[i]
-        if event.flags & UInt16(EV_ERROR) != 0 {
-          // A change of the changelist failed. Applying changes in batches means we can queue up a delete for
-          // a one-shot registration that the kernel removed already, or for a file descriptor that was closed
-          // in the meantime, so those two are expected and dropped.
-          let errnoCode = CInt(event.data)
-          if errnoCode == ENOENT || errnoCode == EBADF {
-            continue
-          }
-        }
-        switch Int16(event.filter) {
-        case Int16(EVFILT_USER):
-          // User wakeup event - nothing to do, just unblocks
-          break
-        case Int16(EVFILT_TIMER):
-          // Timer event - reset the corresponding timer state
-          switch Int(event.ident) {
-          case 1:
-            // Continuous clock timer fired
-            self.nextContinuousClockTimer = nil
-          case 2:
-            // Suspending clock timer fired
-            self.nextSuspendingClockTimer = nil
-          default:
-            fatalError("Unknown timer identifier in kqueue event: \(event.ident)")
-          }
-        case Int16(EVFILT_READ), Int16(EVFILT_WRITE):
-          let isRead = Int16(event.filter) == Int16(EVFILT_READ)
-          onEvent(
-            ReadinessEvent(
-              registrationID: UInt32(UInt(bitPattern: event.udata)),
-              fileDescriptor: CInt(event.ident),
-              // `EV_EOF` is reported alongside readiness and the operation that
-              // follows surfaces the end of the stream, so we treat it as being ready.
-              isReadable: isRead,
-              isWritable: !isRead,
-              isError: event.flags & UInt16(EV_ERROR) != 0
-            )
-          )
-        default:
-          fatalError("Unknown filter type in kqueue event: \(event.filter)")
-        }
+  /// Processes one event that ``waitForEvents(strategy:into:)`` handed back.
+  ///
+  /// - Parameter event: The event to process.
+  /// - Returns: The readiness of a file descriptor that an operation waits on, or `nil` if the event was one of
+  ///   this backend's own or an expected failure of a change.
+  private mutating func process(_ event: Darwin.kevent) -> ReadinessEvent? {
+    if event.flags & UInt16(EV_ERROR) != 0 {
+      // A change of the changelist failed. Applying changes in batches means
+      // we can queue up a delete for a one-shot registration that the kernel
+      // removed already, or for a file descriptor that was closed in the meantime,
+      // so those two are expected and dropped.
+      let errnoCode = CInt(event.data)
+      if errnoCode == ENOENT || errnoCode == EBADF {
+        return nil
       }
+    }
+    switch Int16(event.filter) {
+    case Int16(EVFILT_USER):
+      // User wakeup event - nothing to do, just unblocks
+      return nil
+    case Int16(EVFILT_TIMER):
+      // Timer event - reset the corresponding timer state
+      switch Int(event.ident) {
+      case 1:
+        // Continuous clock timer fired
+        self.nextContinuousClockTimer = nil
+      case 2:
+        // Suspending clock timer fired
+        self.nextSuspendingClockTimer = nil
+      default:
+        fatalError("Unknown timer identifier in kqueue event: \(event.ident)")
+      }
+      return nil
+    case Int16(EVFILT_READ), Int16(EVFILT_WRITE):
+      let isRead = Int16(event.filter) == Int16(EVFILT_READ)
+      return ReadinessEvent(
+        registrationID: UInt32(UInt(bitPattern: event.udata)),
+        fileDescriptor: CInt(event.ident),
+        // `EV_EOF` is reported alongside readiness and the operation that
+        // follows surfaces the end of the stream, so we treat it as being ready.
+        isReadable: isRead,
+        isWritable: !isRead,
+        isError: event.flags & UInt16(EV_ERROR) != 0
+      )
+    default:
+      fatalError("Unknown filter type in kqueue event: \(event.filter)")
     }
   }
 
@@ -373,19 +376,18 @@ extension KQueueReadinessBackend: IOBackend {
       strategy = .now
     }
 
-    // The events are collected first and handled afterwards: handling them
-    // arms new interest, which must not happen while we are waiting.
     try withTemporaryAllocation(
-      of: ReadinessEvent.self,
+      of: Darwin.kevent.self,
       capacity: Self.maxEvents
     ) { events in
-      try self.whenReady(strategy: strategy) { event in
-        events.append(event)
-      }
+      try self.waitForEvents(strategy: strategy, into: &events)
 
       for index in events.indices {
-        guard let registration = self.operations.handle(events[index]) else {
-          // The event was stale, or nothing waits on the file descriptor anymore.
+        guard let readiness = self.process(events[index]),
+          let registration = self.operations.handle(readiness)
+        else {
+          // The event was one of our own, stale, or
+          // nothing waits on the file descriptor anymore.
           continue
         }
         self.arm(registration)
@@ -400,7 +402,13 @@ extension KQueueReadinessBackend: IOBackend {
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 extension KQueueReadinessBackend: IOBackend {
   mutating func wait(strategy: IOWaitStrategy) throws {
-    try self.whenReady(strategy: strategy)
+    try withTemporaryAllocation(of: Darwin.kevent.self, capacity: Self.maxEvents) { events in
+      try self.waitForEvents(strategy: strategy, into: &events)
+
+      for index in events.indices {
+        _ = self.process(events[index])
+      }
+    }
   }
 }
 #endif
