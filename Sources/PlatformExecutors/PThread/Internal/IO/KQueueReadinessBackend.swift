@@ -55,6 +55,11 @@ struct KQueueReadinessBackend: ~Copyable {
   /// The next suspending clock timer to avoid re-arming the timer if possible.
   fileprivate var nextSuspendingClockTimer: SuspendingClock.Instant?
 
+  #if ExperimentalIO
+  /// The operations that are waiting for their file descriptor to become ready.
+  private var operations = ReadinessOperations()
+  #endif
+
   init() throws {
     self.kqueueFD = try! Self.kqueue()
 
@@ -145,17 +150,23 @@ struct KQueueReadinessBackend: ~Copyable {
     }
   }
 
+  /// The maximum number of events that are processed in a single tick.
+  private static var maxEvents: Int { 64 }
+
   /// Blocks until a registered file descriptor became ready, a timer fired or the wakeup was called.
   ///
-  /// - Parameter strategy: The strategy to use for blocking.
-  private mutating func whenReady(strategy: IOWaitStrategy) throws {
-    // First we append the timer changes.
+  /// - Parameters:
+  ///   - strategy: The strategy to use for blocking.
+  ///   - onEvent: The closure called for every registered file descriptor that became ready.
+  private mutating func whenReady(
+    strategy: IOWaitStrategy,
+    onEvent: (ReadinessEvent) -> Void = { _ in }
+  ) throws {
     self.appendTimerChanges(strategy: strategy)
 
     let timespec = Self.toKQueueTimeSpec(strategy: strategy)
 
-    // We need to handle the user event and the two timer events.
-    let maxEvents = 3
+    let maxEvents = Self.maxEvents
     try withUnsafeTemporaryAllocation(of: Darwin.kevent.self, capacity: maxEvents) { eventsPointer in
       let readyEvents = try timespec.withUnsafeOptionalPointer { ts in
         try self.pendingChanges.withUnsafeBufferPointer { changelist in
@@ -202,6 +213,19 @@ struct KQueueReadinessBackend: ~Copyable {
           default:
             fatalError("Unknown timer identifier in kqueue event: \(event.ident)")
           }
+        case Int16(EVFILT_READ), Int16(EVFILT_WRITE):
+          let isRead = Int16(event.filter) == Int16(EVFILT_READ)
+          onEvent(
+            ReadinessEvent(
+              registrationID: UInt32(UInt(bitPattern: event.udata)),
+              fileDescriptor: CInt(event.ident),
+              // `EV_EOF` is reported alongside readiness and the operation that
+              // follows surfaces the end of the stream, so we treat it as being ready.
+              isReadable: isRead,
+              isWritable: !isRead,
+              isError: event.flags & UInt16(EV_ERROR) != 0
+            )
+          )
         default:
           fatalError("Unknown filter type in kqueue event: \(event.filter)")
         }
@@ -289,31 +313,87 @@ struct KQueueReadinessBackend: ~Copyable {
     }
   }
 
+  #if ExperimentalIO
+  /// Arms the interest of a registration.
+  ///
+  /// The registrations are one-shot, so kqueue removes them as soon as they produced an event and an
+  /// operation that has to wait again needs to be re-armed.
+  private mutating func arm(_ registration: ReadinessOperations.Registration) {
+    let filters = [
+      (EVFILT_READ, registration.interest.contains(.read)),
+      (EVFILT_WRITE, registration.interest.contains(.write)),
+    ]
+    for (filter, isInterested) in filters where isInterested {
+      var event = Darwin.kevent()
+      event.ident = UInt(UInt32(bitPattern: registration.fileDescriptor))
+      event.filter = Int16(filter)
+      event.flags = UInt16(EV_ADD | EV_ENABLE | EV_ONESHOT)
+      event.fflags = 0
+      event.data = 0
+      event.udata = UnsafeMutableRawPointer(bitPattern: UInt(registration.registrationID))
+      self.pendingChanges.append(event)
+    }
+  }
+  #endif
 }
 
 #if ExperimentalIO
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 extension KQueueReadinessBackend: IOBackend {
-  // TODO: Implement IO operations
   static func attempt(_ operation: IOOperation) -> Result<Int, IOError>? {
-    fatalError("No support for IO operations")
+    ReadinessOperations.attempt(operation)
   }
 
   mutating func submit(_ operation: IOOperation, id: IOOperationID) {
-    fatalError("No support for IO operations")
+    guard let registration = self.operations.submit(operation, id: id) else {
+      // The operation completed on the spot, a close for example.
+      return
+    }
+    self.arm(registration)
   }
 
   mutating func cancel(_ id: IOOperationID) {
-    fatalError("No support for IO operations")
+    guard let registration = self.operations.cancel(id) else {
+      // Either the operation completed already, or nothing waits on its
+      // file descriptor anymore.
+      return
+    }
+    self.arm(registration)
   }
 
   mutating func wait(
     strategy: IOWaitStrategy,
     completions: inout [(IOOperationID, Result<Int, IOError>)]
   ) throws {
-    // Waiting is how the executor blocks whether or not it has I/O in flight, so it works already. Nothing can
-    // be submitted yet, so there is never a result to report.
-    try self.whenReady(strategy: strategy)
+    // Something may have completed without kqueue since the last tick,
+    // such as a cancelled operation or a close. Nothing wakes us up for
+    // those, so we must not block if there are any.
+    var strategy = strategy
+    if self.operations.hasReadyResults {
+      strategy = .now
+    }
+
+    // The events are collected first and handled afterwards: handling them
+    // arms new interest, which must not happen while we are waiting.
+    try withTemporaryAllocation(
+      of: ReadinessEvent.self,
+      capacity: Self.maxEvents
+    ) { events in
+      try self.whenReady(strategy: strategy) { event in
+        events.append(event)
+      }
+
+      for index in events.indices {
+        guard let registration = self.operations.handle(events[index]) else {
+          // The event was stale, or nothing waits on the file descriptor anymore.
+          continue
+        }
+        self.arm(registration)
+      }
+    }
+
+    // The results are handed over last, once everything is armed.
+    self.operations.takeReadyResults(into: &completions)
   }
 }
 #else
