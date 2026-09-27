@@ -48,7 +48,7 @@ import Dispatch
 /// ```
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 package final class PThreadExecutor: TaskExecutor, @unchecked Sendable {
-  /// The mechanism that this executor waits for work on.
+  /// The mechanism that performs this executor's I/O.
   typealias Backend = PlatformIOBackend
   /// This is the state that is accessed from multiple threads; hence, it must be protected via a lock.
   private struct MultiThreadedState: ~Copyable {
@@ -431,14 +431,23 @@ package final class PThreadExecutor: TaskExecutor, @unchecked Sendable {
         break
       }
 
-      let strategy = self.currentIOWaitStrategy(
+      var strategy = self.currentIOWaitStrategy(
         moreJobsQueued: moreJobsQueued,
         nextContinuousClockDeadline: nextContinuousClockDeadline,
         nextSuspendingClockDeadline: nextSuspendingClockDeadline
       )
 
-      // Let's wait on the backend until there is work to do
+      // Let's wait on the backend until an operation completes,
+      // a timer fires or there is other work to do.
+      #if ExperimentalIO
+      try self.backend.wait(strategy: strategy) { id, result in
+        if #available(anyAppleOS 27.0, *) {
+          fatalError("No support for IO operations")
+        }
+      }
+      #else
       try self.backend.wait(strategy: strategy)
+      #endif
 
       // Our backend unblocked and we are going to pop some jobs
       self._multiThreadedState.withLock {

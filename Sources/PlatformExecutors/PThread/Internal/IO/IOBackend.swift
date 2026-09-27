@@ -18,7 +18,8 @@
 ///
 /// ## Threading
 ///
-/// ``wakeup(_:)`` can be called from any thread. Everything else is only ever called on the executor's thread.
+/// ``attempt(_:)`` and ``wakeup(_:)`` can be called from any thread. Everything else is only ever
+/// called on the executor's thread.
 ///
 /// - Note: Nothing is ever dispatched through this protocol. The executor will call directly to a backend.
 /// The purpose of this protocol is to ensure that all backends provide the same uniform API
@@ -40,9 +41,45 @@ protocol IOBackend: ~Copyable {
   /// - Parameter handle: The handle of the backend to wake up.
   static func wakeup(_ handle: WakeupHandle) throws
 
+  #if ExperimentalIO
+  /// Performs the operation if it can be performed without waiting.
+  ///
+  /// This allows backends to fast-path operations when they are ready i.e. when data is already available.
+  ///
+  /// - Important: This can be called from any thread.
+  ///
+  /// - Parameter operation: The operation to perform.
+  /// - Returns: The result of the operation, or `nil` if it cannot be performed without waiting.
+  static func attempt(_ operation: IOOperation) throws(IOError) -> Int?
+
+  /// Submits an operation whose result is reported later.
+  ///
+  /// - Parameters:
+  ///   - operation: The operation to submit.
+  ///   - id: The identity to report the result of the operation with.
+  mutating func submit(_ operation: IOOperation, id: IOOperationID) throws(IOError)
+
+  /// Cancels a submitted operation.
+  ///
+  /// - Important: The operation still reports a result.
+  ///
+  /// - Parameter id: The identity of the operation to cancel.
+  mutating func cancel(_ id: IOOperationID)
+
+  /// Waits for work to become available and reports every operation that completed.
+  ///
+  /// - Parameters:
+  ///   - strategy: How long to wait for work to become available.
+  ///   - onCompletion: The closure called with the result of every operation that completed.
+  mutating func wait(
+    strategy: IOWaitStrategy,
+    onCompletion: (IOOperationID, Result<Int, IOError>) -> Void
+  ) throws
+  #else
   /// Waits for work to become available.
   ///
   /// - Parameter strategy: How long to wait for work to become available.
   mutating func wait(strategy: IOWaitStrategy) throws
+  #endif
 }
 #endif
