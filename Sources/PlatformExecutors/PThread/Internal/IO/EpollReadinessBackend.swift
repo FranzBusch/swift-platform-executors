@@ -29,7 +29,7 @@ import CPlatformExecutors
 
 /// An I/O mechanism that uses epoll for eventing.
 @available(macOS 14.0, iOS 17.0, watchOS 10.0, tvOS 17.0, *)
-struct EpollReadinessBackend: ~Copyable, IOBackend {
+struct EpollReadinessBackend: ~Copyable {
   /// User data supports (un)packing into an `UInt64` because epoll has a user info field that we can attach which is
   /// up to 64 bits wide. We're using all of those 64 bits, 32 for a "registration ID" and 32 for the file descriptor.
   struct UserData {
@@ -50,6 +50,7 @@ struct EpollReadinessBackend: ~Copyable, IOBackend {
 
   /// A handle that other threads use to wake this backend up.
   struct WakeupHandle: Sendable {
+    /// The event file descriptor never changes so we can use it to wakeup the selector from any thread.
     fileprivate let eventFD: CInt
   }
 
@@ -146,11 +147,11 @@ struct EpollReadinessBackend: ~Copyable, IOBackend {
     try! close(descriptor: self.epollFD)
   }
 
-  /// Blocks until there is work to do.
-  mutating func wait(
-    strategy: IOWaitStrategy
-  ) throws {
-    // Right now we only handle three events at most: EventFD and two TimerFDs
+  /// Blocks until a registered file descriptor became ready, a timer fired or the wakeup was called.
+  ///
+  /// - Parameter strategy: The strategy to use for blocking.
+  private mutating func whenReady(strategy: IOWaitStrategy) throws {
+    // We need to handle the event FD and the two timer FDs.
     let maxEvents = 3
 
     try withUnsafeTemporaryAllocation(of: Epoll.epoll_event.self, capacity: maxEvents) { eventsPointer in
@@ -268,6 +269,40 @@ struct EpollReadinessBackend: ~Copyable, IOBackend {
   }
 }
 
+#if ExperimentalIO
+@available(macOS 14.0, iOS 17.0, watchOS 10.0, tvOS 17.0, *)
+extension EpollReadinessBackend: IOBackend {
+  // TODO: Implement IO operations
+  static func attempt(_ operation: IOOperation) throws(IOError) -> Int? {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func submit(_ operation: IOOperation, id: IOOperationID) throws(IOError) {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func cancel(_ id: IOOperationID) {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func wait(
+    strategy: IOWaitStrategy,
+    onCompletion: (IOOperationID, Result<Int, IOError>) -> Void
+  ) throws {
+    // Waiting is how the executor blocks whether or not it has I/O in flight, so it works already. Nothing can
+    // be submitted yet, so there is never a result to report.
+    try self.whenReady(strategy: strategy)
+  }
+}
+#else
+@available(macOS 14.0, iOS 17.0, watchOS 10.0, tvOS 17.0, *)
+extension EpollReadinessBackend: IOBackend {
+  mutating func wait(strategy: IOWaitStrategy) throws {
+    try self.whenReady(strategy: strategy)
+  }
+}
+#endif
+
 internal enum Epoll {
   internal typealias epoll_event = CPlatformExecutors.epoll_event
 
@@ -282,6 +317,7 @@ internal enum Epoll {
   internal static let EPOLLRDHUP: CUnsignedInt = 8192  //numericCast(EPOLLRDHUP)
   internal static let EPOLLHUP: CUnsignedInt = 16  //numericCast(EPOLLHUP)
   internal static let EPOLLET: CUnsignedInt = 2_147_483_648  //numericCast(EPOLLET)
+  internal static let EPOLLONESHOT: CUnsignedInt = 1_073_741_824  //numericCast(EPOLLONESHOT)
   #elseif canImport(Musl)
   internal static let EPOLLIN: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLIN)
   internal static let EPOLLOUT: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLOUT)
@@ -289,6 +325,7 @@ internal enum Epoll {
   internal static let EPOLLRDHUP: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLRDHUP)
   internal static let EPOLLHUP: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLHUP)
   internal static let EPOLLET: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLET)
+  internal static let EPOLLONESHOT: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLONESHOT)
   #else
   internal static let EPOLLIN: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLIN.rawValue)
   internal static let EPOLLOUT: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLOUT.rawValue)
@@ -296,6 +333,7 @@ internal enum Epoll {
   internal static let EPOLLRDHUP: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLRDHUP.rawValue)
   internal static let EPOLLHUP: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLHUP.rawValue)
   internal static let EPOLLET: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLET.rawValue)
+  internal static let EPOLLONESHOT: CUnsignedInt = numericCast(CPlatformExecutors.EPOLLONESHOT.rawValue)
   #endif
 
   internal static let ENOENT: CUnsignedInt = numericCast(CPlatformExecutors.ENOENT)

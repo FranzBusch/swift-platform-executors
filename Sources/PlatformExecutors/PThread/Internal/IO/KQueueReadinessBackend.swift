@@ -30,14 +30,21 @@ private let sysKevent = kevent
 
 /// An I/O mechanism that uses kqueue for eventing.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-struct KQueueReadinessBackend: ~Copyable, IOBackend {
+struct KQueueReadinessBackend: ~Copyable {
   /// A handle that other threads use to wake this backend up.
   struct WakeupHandle: Sendable {
+    /// The kqueue file descriptor never changes so we can use it to wakeup the selector from any thread.
     fileprivate let kqueueFD: CInt
   }
 
   /// The file descriptor of the queue.
   fileprivate var kqueueFD: CInt
+
+  /// The registration changes that have not been applied yet.
+  ///
+  /// kqueue takes a changelist in the same call that waits for events, so changes are accumulated here and
+  /// applied by the next wait.
+  private var pendingChanges: [Darwin.kevent] = []
 
   /// A handle that other threads use to wake this backend up.
   var wakeupHandle: WakeupHandle {
@@ -60,7 +67,7 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
     event.flags = UInt16(EV_ADD | EV_ENABLE | EV_CLEAR)
     try withUnsafeMutablePointer(to: &event) { ptr in
       try Self.kqueueApplyEventChangeSet(
-        selectorFD: kqueueFD,
+        kqueueFD: kqueueFD,
         keventBuffer: UnsafeMutableBufferPointer(start: ptr, count: 1)
       )
     }
@@ -100,7 +107,7 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
 
   /// Apply a kqueue changeset by calling the `kevent` function with the `kevent`s supplied in `keventBuffer`.
   private static func kqueueApplyEventChangeSet(
-    selectorFD: CInt,
+    kqueueFD: CInt,
     keventBuffer: UnsafeMutableBufferPointer<kevent>
   ) throws {
     guard keventBuffer.count > 0 else {
@@ -109,7 +116,7 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
     }
     do {
       try Self.kevent(
-        kq: selectorFD,
+        kq: kqueueFD,
         changelist: keventBuffer.baseAddress!,
         nchanges: CInt(keventBuffer.count),
         eventlist: nil,
@@ -138,34 +145,47 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
     }
   }
 
-  /// Blocks until there is work to do.
-  mutating func wait(
-    strategy: IOWaitStrategy
-  ) throws {
-    // Set up timers if needed
-    try self.setupTimers(strategy: strategy)
+  /// Blocks until a registered file descriptor became ready, a timer fired or the wakeup was called.
+  ///
+  /// - Parameter strategy: The strategy to use for blocking.
+  private mutating func whenReady(strategy: IOWaitStrategy) throws {
+    // First we append the timer changes.
+    self.appendTimerChanges(strategy: strategy)
 
     let timespec = Self.toKQueueTimeSpec(strategy: strategy)
 
-    // We need to handle timer events, so allocate space for events
-    let maxEvents = 3  // User event + 2 timer events
+    // We need to handle the user event and the two timer events.
+    let maxEvents = 3
     try withUnsafeTemporaryAllocation(of: Darwin.kevent.self, capacity: maxEvents) { eventsPointer in
       let readyEvents = try timespec.withUnsafeOptionalPointer { ts in
-        Int(
-          try Self.kevent(
-            kq: self.kqueueFD,
-            changelist: nil,
-            nchanges: 0,
-            eventlist: eventsPointer.baseAddress!,
-            nevents: CInt(maxEvents),
-            timeout: ts
+        try self.pendingChanges.withUnsafeBufferPointer { changelist in
+          Int(
+            try Self.kevent(
+              kq: self.kqueueFD,
+              changelist: changelist.baseAddress,
+              nchanges: CInt(changelist.count),
+              eventlist: eventsPointer.baseAddress!,
+              nevents: CInt(maxEvents),
+              timeout: ts
+            )
           )
-        )
+        }
       }
+      // The kernel has taken the changes, so we can clear the array.
+      self.pendingChanges.removeAll(keepingCapacity: true)
 
       // Process the ready events
       for i in 0..<readyEvents {
         let event = eventsPointer[i]
+        if event.flags & UInt16(EV_ERROR) != 0 {
+          // A change of the changelist failed. Applying changes in batches means we can queue up a delete for
+          // a one-shot registration that the kernel removed already, or for a file descriptor that was closed
+          // in the meantime, so those two are expected and dropped.
+          let errnoCode = CInt(event.data)
+          if errnoCode == ENOENT || errnoCode == EBADF {
+            continue
+          }
+        }
         switch Int16(event.filter) {
         case Int16(EVFILT_USER):
           // User wakeup event - nothing to do, just unblocks
@@ -189,8 +209,8 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
     }
   }
 
-  /// Set up kqueue timers for the given strategy
-  private mutating func setupTimers(strategy: IOWaitStrategy) throws {
+  /// Appends the timer changes for the given strategy.
+  private mutating func appendTimerChanges(strategy: IOWaitStrategy) {
     guard case .blockUntilTimeout(let continuousClockInstant, let suspendingClockInstant) = strategy else {
       return
     }
@@ -211,7 +231,7 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
         )
         let nanoseconds =
           Int(duration.components.seconds) * 1_000_000_000 + Int(duration.components.attoseconds / 1_000_000_000)
-        try self.setTimer(ident: 1, nanoseconds: nanoseconds)
+        self.pendingChanges.append(Self.timerEvent(ident: 1, nanoseconds: nanoseconds))
         self.nextContinuousClockTimer = continuousClockInstant
       }
     }
@@ -232,14 +252,14 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
         )
         let nanoseconds =
           Int(duration.components.seconds) * 1_000_000_000 + Int(duration.components.attoseconds / 1_000_000_000)
-        try self.setTimer(ident: 2, nanoseconds: nanoseconds)
+        self.pendingChanges.append(Self.timerEvent(ident: 2, nanoseconds: nanoseconds))
         self.nextSuspendingClockTimer = suspendingClockInstant
       }
     }
   }
 
-  /// Set a kqueue timer for the given instant
-  private func setTimer(ident: Int, nanoseconds: Int) throws {
+  /// The change that arms a kqueue timer for the given instant.
+  private static func timerEvent(ident: Int, nanoseconds: Int) -> Darwin.kevent {
     var event = Darwin.kevent()
     event.ident = UInt(ident)
     event.filter = Int16(EVFILT_TIMER)
@@ -247,13 +267,7 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
     event.fflags = UInt32(NOTE_NSECONDS)
     event.data = nanoseconds
     event.udata = nil
-
-    try withUnsafeMutablePointer(to: &event) { ptr in
-      try Self.kqueueApplyEventChangeSet(
-        selectorFD: self.kqueueFD,
-        keventBuffer: UnsafeMutableBufferPointer(start: ptr, count: 1)
-      )
-    }
+    return event
   }
 
   /// Wakes up a backend from any thread.
@@ -269,12 +283,47 @@ struct KQueueReadinessBackend: ~Copyable, IOBackend {
     event.flags = 0
     try withUnsafeMutablePointer(to: &event) { ptr in
       try Self.kqueueApplyEventChangeSet(
-        selectorFD: handle.kqueueFD,
+        kqueueFD: handle.kqueueFD,
         keventBuffer: UnsafeMutableBufferPointer(start: ptr, count: 1)
       )
     }
   }
+
 }
+
+#if ExperimentalIO
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+extension KQueueReadinessBackend: IOBackend {
+  // TODO: Implement IO operations
+  static func attempt(_ operation: IOOperation) throws(IOError) -> Int? {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func submit(_ operation: IOOperation, id: IOOperationID) throws(IOError) {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func cancel(_ id: IOOperationID) {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func wait(
+    strategy: IOWaitStrategy,
+    onCompletion: (IOOperationID, Result<Int, IOError>) -> Void
+  ) throws {
+    // Waiting is how the executor blocks whether or not it has I/O in flight, so it works already. Nothing can
+    // be submitted yet, so there is never a result to report.
+    try self.whenReady(strategy: strategy)
+  }
+}
+#else
+@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
+extension KQueueReadinessBackend: IOBackend {
+  mutating func wait(strategy: IOWaitStrategy) throws {
+    try self.whenReady(strategy: strategy)
+  }
+}
+#endif
 
 extension Optional {
   fileprivate func withUnsafeOptionalPointer<T>(

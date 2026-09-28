@@ -22,6 +22,9 @@ import wasi_pthread
 /// variable: ``wakeup(_:)`` (called from any thread) raises a flag and signals;
 /// ``wait(strategy:)`` waits for the flag, with a timed wait for the
 /// earliest pending deadline. Spurious wakeups just re-check the flag.
+///
+/// - Important: This backend does currently not support any IO operations.
+/// actually be reached.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 struct ConditionSelectorBackend: ~Copyable, IOBackend {
   /// A handle that other threads use to wake this backend up.
@@ -42,8 +45,33 @@ struct ConditionSelectorBackend: ~Copyable, IOBackend {
 
   init() throws {}
 
+  #if ExperimentalIO
+  static func attempt(_ operation: IOOperation) throws(IOError) -> Int? {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func submit(_ operation: IOOperation, id: IOOperationID) throws(IOError) {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func cancel(_ id: IOOperationID) {
+    fatalError("No support for IO operations")
+  }
+
+  mutating func wait(
+    strategy: IOWaitStrategy,
+    onCompletion: (IOOperationID, Result<Int, IOError>) -> Void
+  ) throws {
+    try self.blockUntilWork(strategy: strategy)
+  }
+  #else
   /// Blocks until there is work to do.
   mutating func wait(strategy: IOWaitStrategy) throws {
+    try self.blockUntilWork(strategy: strategy)
+  }
+  #endif
+
+  private mutating func blockUntilWork(strategy: IOWaitStrategy) throws {
     switch strategy {
     case .now:
       // Nothing to wait for; a wakeup that already happened is consumed.
