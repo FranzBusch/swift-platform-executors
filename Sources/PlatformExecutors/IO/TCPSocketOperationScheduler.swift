@@ -21,10 +21,11 @@ public protocol TCPSocketOperationScheduler: OperationScheduler {
   //
   // TODO: Need to support a more general endpoint type that accepts hostnames.
 
-  /// The handle identifying a TCP socket of this scheduler.
-  ///
-  /// Listening and connected sockets are both identified by this type.
-  associatedtype TCPSocket
+  /// The handle identifying a listening TCP socket of this scheduler.
+  associatedtype TCPListener: ~Copyable
+
+  /// The handle identifying a connected TCP socket of this scheduler.
+  associatedtype TCPConnection: ~Copyable
 
   /// Submits an operation that creates a new socket and connects it to the given address.
   ///
@@ -34,7 +35,7 @@ public protocol TCPSocketOperationScheduler: OperationScheduler {
   ///   - address: The address to connect to.
   /// - Returns: The registration of the operation.
   func submitConnect(
-    _ continuation: consuming Continuation<TCPSocket, IOError>,
+    _ continuation: consuming Continuation<TCPConnection, IOError>,
     state: inout OutputSpan<OperationState>,
     to address: SocketAddress
   ) -> OperationRegistration
@@ -50,7 +51,7 @@ public protocol TCPSocketOperationScheduler: OperationScheduler {
   ///     before refusing new ones.
   /// - Returns: The registration of the operation.
   func submitListen(
-    _ continuation: consuming Continuation<TCPSocket, IOError>,
+    _ continuation: consuming Continuation<TCPListener, IOError>,
     state: inout OutputSpan<OperationState>,
     on address: SocketAddress,
     backlog: Int
@@ -60,15 +61,14 @@ public protocol TCPSocketOperationScheduler: OperationScheduler {
   /// listening socket.
   ///
   /// - Parameters:
-  ///   - continuation: The continuation resumed with the accepted socket and
-  ///     the address of its peer.
+  ///   - continuation: The continuation resumed with the accepted socket.
   ///   - state: The per-operation state of the scheduler.
-  ///   - socket: The listening socket to accept a connection from.
+  ///   - listener: The listening socket to accept a connection from.
   /// - Returns: The registration of the operation.
   func submitAccept(
-    _ continuation: consuming Continuation<(socket: TCPSocket, peerAddress: SocketAddress), IOError>,
+    _ continuation: consuming Continuation<TCPConnection, IOError>,
     state: inout OutputSpan<OperationState>,
-    socket: TCPSocket
+    listener: borrowing TCPListener
   ) -> OperationRegistration
 
   /// Submits an operation that reads from a socket into the given buffer.
@@ -79,14 +79,15 @@ public protocol TCPSocketOperationScheduler: OperationScheduler {
   ///
   /// - Parameters:
   ///   - continuation: The continuation resumed with the number of bytes read.
+  ///     Zero indicates that the peer closed its side of the connection.
   ///   - state: The per-operation state of the scheduler.
   ///   - socket: The socket to read from.
   ///   - buffer: The buffer to read into.
   /// - Returns: The registration of the operation.
   func submitRead(
-    _ continuation: consuming Continuation<Void, IOError>,
+    _ continuation: consuming Continuation<Int, IOError>,
     state: inout OutputSpan<OperationState>,
-    socket: TCPSocket,
+    connection: borrowing TCPConnection,
     into buffer: inout OutputRawSpan
   ) -> OperationRegistration
 
@@ -106,7 +107,7 @@ public protocol TCPSocketOperationScheduler: OperationScheduler {
   func submitWrite(
     _ continuation: consuming Continuation<Int, IOError>,
     state: inout OutputSpan<OperationState>,
-    socket: TCPSocket,
+    connection: borrowing TCPConnection,
     from buffer: RawSpan
   ) -> OperationRegistration
 
@@ -127,7 +128,7 @@ public protocol TCPSocketOperationScheduler: OperationScheduler {
   func submitShutdown(
     _ continuation: consuming Continuation<Void, IOError>,
     state: inout OutputSpan<OperationState>,
-    socket: TCPSocket,
+    connection: borrowing TCPConnection,
     direction: SocketShutdownDirection
   ) -> OperationRegistration
 
@@ -141,7 +142,20 @@ public protocol TCPSocketOperationScheduler: OperationScheduler {
   func submitClose(
     _ continuation: consuming Continuation<Void, IOError>,
     state: inout OutputSpan<OperationState>,
-    socket: TCPSocket
+    connection: consuming TCPConnection
+  ) -> OperationRegistration
+
+  /// Submits an operation that closes a listening socket.
+  ///
+  /// - Parameters:
+  ///   - continuation: The continuation resumed once the listening socket is closed.
+  ///   - state: The per-operation state of the scheduler.
+  ///   - listener: The listening socket to close.
+  /// - Returns: The registration of the operation.
+  func submitClose(
+    _ continuation: consuming Continuation<Void, IOError>,
+    state: inout OutputSpan<OperationState>,
+    listener: consuming TCPListener
   ) -> OperationRegistration
 }
 #endif
