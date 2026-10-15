@@ -102,12 +102,11 @@ extension TCPConnection.ReadHalf: AsyncReader {
     var buffer = self.asyncReadState.buffer.take() ?? UniqueArray<UInt8>()
     buffer.removeAll(keepingCapacity: true)
     if count > 0 {
-      let bytes = UnsafeRawBufferPointer(rebasing: scratch.pointer[..<count])
-      buffer.append(addingCount: count) { output in
-        for byte in bytes {
-          output.append(byte)
-        }
-      }
+      let bytes = UnsafeBufferPointer(
+        start: scratch.pointer.baseAddress!.assumingMemoryBound(to: UInt8.self),
+        count: count
+      )
+      buffer.append(copying: Span(_unsafeElements: bytes))
     }
 
     do throws(Failure) {
