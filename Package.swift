@@ -46,6 +46,13 @@ let package = Package(
       description: "Trait performing the I/O with io_uring on Linux",
       enabledTraits: ["ExperimentalIO"]
     ),
+    // Conforms the halves of a TCP connection to the `AsyncReader` and `AsyncWriter` protocols of
+    // swift-async-algorithms.
+    .trait(
+      name: "ExperimentalAsyncStreaming",
+      description: "Trait conforming the I/O types to the async streaming protocols",
+      enabledTraits: ["ExperimentalIO"]
+    ),
   ],
   dependencies: [
     .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0"),
@@ -57,7 +64,13 @@ let package = Package(
       traits: [
         .defaults,
         .trait(name: "UnstableHashedContainers", condition: .when(traits: ["ExperimentalIO"])),
+        .trait(name: "UnstableContainersPreview", condition: .when(traits: ["ExperimentalAsyncStreaming"])),
       ]
+    ),
+    .package(
+      url: "https://github.com/apple/swift-async-algorithms.git",
+      exact: "1.1.7",
+      traits: ["UnstableAsyncStreaming"]
     ),
   ],
   targets: [
@@ -85,6 +98,16 @@ let package = Package(
           package: "swift-system",
           condition: .when(platforms: [.linux], traits: ["ExperimentalIOUring"])
         ),
+        .product(
+          name: "ContainersPreview",
+          package: "swift-collections",
+          condition: .when(traits: ["ExperimentalAsyncStreaming"])
+        ),
+        .product(
+          name: "AsyncStreaming",
+          package: "swift-async-algorithms",
+          condition: .when(traits: ["ExperimentalAsyncStreaming"])
+        ),
       ],
       swiftSettings: swiftSettings
     ),
@@ -105,6 +128,21 @@ let package = Package(
           name: "BasicContainers",
           package: "swift-collections",
           condition: .when(traits: ["ExperimentalIO"])
+        ),
+        .product(
+          name: "ContainersPreview",
+          package: "swift-collections",
+          condition: .when(traits: ["ExperimentalAsyncStreaming"])
+        ),
+        .product(
+          name: "BasicContainers",
+          package: "swift-collections",
+          condition: .when(traits: ["ExperimentalAsyncStreaming"])
+        ),
+        .product(
+          name: "AsyncStreaming",
+          package: "swift-async-algorithms",
+          condition: .when(traits: ["ExperimentalAsyncStreaming"])
         ),
       ]
     ),
