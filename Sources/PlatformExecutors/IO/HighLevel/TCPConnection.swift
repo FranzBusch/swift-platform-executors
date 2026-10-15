@@ -280,5 +280,23 @@ extension TCPConnection {
     var writeHalf = WriteHalf(self)
     return try await body(&readHalf, &writeHalf)
   }
+
+  /// Lends the read and the write direction of the connection to the given closure as owned values.
+  ///
+  /// This is ``withSplit(_:)`` for callers that have to own the halves, for example to move them into a type that
+  /// wraps them, or to call a `consuming` method on them such as `AsyncWriter.finish(finalElement:)`.
+  ///
+  /// - Important: The halves cannot escape the closure, so the connection keeps owning the socket
+  /// and must still be closed afterwards.
+  ///
+  /// - Parameter body: The closure that the halves are lent to.
+  /// - Returns: The value that the closure returned.
+  public nonisolated(nonsending) func withOwnedSplit<Return, Failure: Error>(
+    _ body: nonisolated(nonsending) (consuming ReadHalf, consuming WriteHalf) async throws(Failure) -> Return
+  ) async throws(Failure) -> Return {
+    let readHalf = ReadHalf(self)
+    let writeHalf = WriteHalf(self)
+    return try await body(readHalf, writeHalf)
+  }
 }
 #endif

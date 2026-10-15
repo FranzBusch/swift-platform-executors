@@ -197,6 +197,42 @@ struct TCPAsyncStreamingTests {
     }
     #expect(String(decoding: echoed, as: UTF8.self) == "caller managed")
   }
+
+  @Test
+  @available(anyAppleOS 27.0, *)
+  func finishingAnOwnedWriteHalfEndsTheStreamOfThePeer() async throws {
+    let (echoed, sawFinalElement) = try await Self.withEchoServer { address in
+      let connection = try await TCPConnection.connect(to: address)
+      let result = try await connection.withOwnedSplit { readHalf, writeHalf in
+        var readHalf = readHalf
+        var writeHalf = writeHalf
+        try await writeHalf.write { buffer in
+          for byte in "bye".utf8 {
+            buffer.append(byte)
+          }
+        }
+        // The halves are owned, so the writer can be finished, which shuts down the write direction. The echo server
+        // then sees the end of our stream and ends its own.
+        try await writeHalf.finish(finalElement: ())
+
+        var echoed = [UInt8]()
+        var sawFinalElement = false
+        while !sawFinalElement {
+          try await readHalf.read { buffer, finalElement in
+            for index in 0..<buffer.count {
+              echoed.append(buffer[index])
+            }
+            sawFinalElement = finalElement != nil
+          }
+        }
+        return (echoed, sawFinalElement)
+      }
+      try await connection.close()
+      return result
+    }
+    #expect(String(decoding: echoed, as: UTF8.self) == "bye")
+    #expect(sawFinalElement)
+  }
 }
 
 #endif
