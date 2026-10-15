@@ -189,6 +189,11 @@ extension TCPConnection {
     /// The scheduler's handle of the socket.
     private let connection: (any Sendable)?
 
+    #if ExperimentalAsyncStreaming
+    /// The scratch memory and the buffer that the `AsyncReader` conformance reads through.
+    var asyncReadState = AsyncReadState()
+    #endif
+
     @_lifetime(borrow owner)
     fileprivate init(_ owner: borrowing TCPConnection) {
       self.scheduler = owner.scheduler
@@ -216,6 +221,11 @@ extension TCPConnection {
 
     /// The scheduler's handle of the socket.
     private let connection: (any Sendable)?
+
+    #if ExperimentalAsyncStreaming
+    /// The buffer that the `AsyncWriter` conformance writes through.
+    var asyncWriteState = AsyncWriteState()
+    #endif
 
     @_lifetime(borrow owner)
     fileprivate init(_ owner: borrowing TCPConnection) {
