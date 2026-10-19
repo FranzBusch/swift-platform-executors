@@ -1023,26 +1023,26 @@ extension PThreadExecutor {
     /// Creates a resumer whose resumed tasks run inline if they run on the given task executor.
     init(taskExecutor: UnownedTaskExecutor) {
       self.resumeConnection = { continuation, result in
-        unsafe continuation.resume(with: result, on: taskExecutor)
+        unsafe continuation.resumeSynchronously(with: result, on: taskExecutor)
       }
       self.resumeByteCount = { continuation, result in
-        unsafe continuation.resume(with: result, on: taskExecutor)
+        unsafe continuation.resumeSynchronously(with: result, on: taskExecutor)
       }
       self.resumeVoid = { continuation, result in
-        unsafe continuation.resume(with: result, on: taskExecutor)
+        unsafe continuation.resumeSynchronously(with: result, on: taskExecutor)
       }
     }
 
     /// Creates a resumer whose resumed tasks run inline if they are isolated to the given serial executor.
     init(serialExecutor: UnownedSerialExecutor) {
       self.resumeConnection = { continuation, result in
-        unsafe continuation.resume(with: result, isolatedTo: serialExecutor)
+        unsafe continuation.resumeSynchronously(with: result, isolatedTo: serialExecutor)
       }
       self.resumeByteCount = { continuation, result in
-        unsafe continuation.resume(with: result, isolatedTo: serialExecutor)
+        unsafe continuation.resumeSynchronously(with: result, isolatedTo: serialExecutor)
       }
       self.resumeVoid = { continuation, result in
-        unsafe continuation.resume(with: result, isolatedTo: serialExecutor)
+        unsafe continuation.resumeSynchronously(with: result, isolatedTo: serialExecutor)
       }
     }
   }
