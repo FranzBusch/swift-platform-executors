@@ -239,6 +239,28 @@ public final class PThreadTaskExecutor: TaskExecutor {
   internal func next() -> PThreadExecutor {
     unsafe self.executors[abs(self.index.wrappingAdd(1, ordering: .relaxed).newValue % self.executors.count)]
   }
+
+  /// Returns the executor of the pool that the calling thread runs, or the next one if the calling thread is not
+  /// one of the pool.
+  ///
+  /// This is the executor that performs an I/O operation. An operation that a task starts from an executor of the
+  /// pool stays on this executor, so it needs no hop to another thread to submit it and its result needs none to
+  /// resume. A resource does not belong to an executor, so it can be used from any executor of the pool. To use a
+  /// resource from one thread only, run the tasks that use it with the task executor preference of a single
+  /// ``PThreadExecutor``.
+  internal func current() -> PThreadExecutor {
+    if let pointer = unsafe PThread.currentExecutor {
+      // The thread runs an executor, which is not necessarily one of this pool.
+      let executor = unsafe Unmanaged<PThreadExecutor>.fromOpaque(pointer)
+      let index = unsafe executor._withUnsafeGuaranteedRef { $0.poolIndex }
+      if unsafe index < self.executors.count,
+        unsafe UnsafeRawPointer(Unmanaged.passUnretained(self.executors[index]).toOpaque()) == pointer
+      {
+        return unsafe self.executors[index]
+      }
+    }
+    return self.next()
+  }
 }
 
 #if !canImport(Darwin)
