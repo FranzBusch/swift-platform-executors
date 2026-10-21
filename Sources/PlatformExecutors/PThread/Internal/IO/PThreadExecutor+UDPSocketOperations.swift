@@ -45,7 +45,8 @@ import Darwin
     let address = unsafe base.advanced(by: MemoryLayout<DatagramMessage>.offset(of: \.address)!)
     unsafe message.pointee.vector.iov_base = buffer.baseAddress
     unsafe message.pointee.vector.iov_len = buffer.count
-    unsafe message.pointee.header.msg_name = address
+    // Some platforms reject a message that has a name of length zero, so it has no name instead.
+    unsafe message.pointee.header.msg_name = addressLength == 0 ? nil : address
     unsafe message.pointee.header.msg_namelen = addressLength
     unsafe message.pointee.header.msg_iov = vector.assumingMemoryBound(to: iovec.self)
     unsafe message.pointee.header.msg_iovlen = 1
@@ -77,16 +78,67 @@ extension PThreadExecutor: UDPSocketOperationScheduler {
     return UDPSocket(fileDescriptor: socket)
   }
 
+  package func connectUDP(to address: SocketAddress) async throws(IOError) -> UDPSocket {
+    let socket = try StreamSocketSyscall.makeSocket(family: address.family, kind: .datagram)
+    do {
+      // Connecting a datagram socket only records the peer, so it completes right away.
+      try unsafe address.withUnsafeSockAddress { (sockAddr, length) throws(IOError) -> Void in
+        _ = try unsafe StreamSocketSyscall.connect(socket, to: sockAddr, addressLength: length)
+      }
+    } catch {
+      try? StreamSocketSyscall.close(socket)
+      throw error
+    }
+    return UDPSocket(fileDescriptor: socket)
+  }
+
   package func receive(
     socket: borrowing UDPSocket,
     into buffer: inout OutputRawSpan
   ) async throws(IOError) -> (count: Int, sender: SocketAddress) {
+    let (count, sender) = try await self.receiveDatagram(
+      on: socket.fileDescriptor,
+      into: &buffer,
+      addressCapacity: socklen_t(MemoryLayout<sockaddr_storage>.size)
+    )
+    guard let sender = SocketAddress(sender) else {
+      throw IOError(errnoCode: EAFNOSUPPORT)
+    }
+    return (count, sender)
+  }
+
+  package func read(socket: borrowing UDPSocket, into buffer: inout OutputRawSpan) async throws(IOError) -> Int {
+    try await self.receiveDatagram(on: socket.fileDescriptor, into: &buffer, addressCapacity: 0).count
+  }
+
+  package func send(
+    socket: borrowing UDPSocket,
+    from buffer: RawSpan,
+    to address: SocketAddress
+  ) async throws(IOError) -> Int {
+    try await self.sendDatagram(on: socket.fileDescriptor, from: buffer, to: address)
+  }
+
+  package func write(socket: borrowing UDPSocket, from buffer: RawSpan) async throws(IOError) -> Int {
+    try await self.sendDatagram(on: socket.fileDescriptor, from: buffer, to: nil)
+  }
+
+  /// Receives one datagram into the free capacity of the buffer.
+  ///
+  /// - Parameters:
+  ///   - fileDescriptor: The file descriptor of the socket.
+  ///   - buffer: The buffer to receive into.
+  ///   - addressCapacity: The capacity for the address of the sender, which is zero if it is not wanted.
+  private func receiveDatagram(
+    on fileDescriptor: CInt,
+    into buffer: inout OutputRawSpan,
+    addressCapacity: socklen_t
+  ) async throws(IOError) -> (count: Int, sender: sockaddr_storage) {
     // The bytes are received into the free capacity of the buffer, which stays
     // alive while we are suspended since we hold the access to it.
     let freeCapacity = unsafe buffer.withUnsafeMutableBytes { bytes, initializedCount in
       unsafe UnsafeMutableRawBufferPointer(rebasing: bytes[initializedCount...])
     }
-    let fileDescriptor = socket.fileDescriptor
 
     // The kernel writes the message while we are suspended, so it lives in
     // storage that outlives the operation.
@@ -98,7 +150,7 @@ extension PThreadExecutor: UDPSocketOperationScheduler {
       let header = unsafe DatagramMessage.configure(
         message,
         buffer: freeCapacity,
-        addressLength: socklen_t(MemoryLayout<sockaddr_storage>.size)
+        addressLength: addressCapacity
       )
       let count = try await unsafe self.perform(
         .receiveMessage(socket: fileDescriptor, message: header)
@@ -113,27 +165,28 @@ extension PThreadExecutor: UDPSocketOperationScheduler {
     unsafe buffer.withUnsafeMutableBytes { _, initializedCount in
       initializedCount += count
     }
-
-    guard let sender = SocketAddress(sender) else {
-      throw IOError(errnoCode: EAFNOSUPPORT)
-    }
     return (count, sender)
   }
 
-  package func send(
-    socket: borrowing UDPSocket,
+  /// Sends the buffer as one datagram.
+  ///
+  /// - Parameters:
+  ///   - fileDescriptor: The file descriptor of the socket.
+  ///   - buffer: The bytes of the datagram.
+  ///   - address: The address to send to, or `nil` to send to the peer that the socket is connected to.
+  private func sendDatagram(
+    on fileDescriptor: CInt,
     from buffer: RawSpan,
-    to address: SocketAddress
+    to address: SocketAddress?
   ) async throws(IOError) -> Int {
     let bytes = buffer.withUnsafeBytes { unsafe $0 }
-    let fileDescriptor = socket.fileDescriptor
 
     return try await unsafe withTemporaryAllocation(of: DatagramMessage.self, capacity: 1) {
       storage async throws(IOError) -> Int in
       unsafe storage.append(DatagramMessage())
       var messages = unsafe storage.mutableSpan
       let message = messages.withUnsafeMutableBufferPointer { $0.baseAddress! }
-      let addressLength = unsafe address.write(into: &message.pointee.address)
+      let addressLength = unsafe address?.write(into: &message.pointee.address) ?? 0
       let header = unsafe DatagramMessage.configure(
         message,
         buffer: UnsafeMutableRawBufferPointer(mutating: bytes),

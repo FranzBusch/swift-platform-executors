@@ -136,6 +136,67 @@ struct UDPSocketTests {
     }
   }
 
+  @Test(arguments: PThreadIOBackend.tested, [1, 4])
+  @available(anyAppleOS 27.0, *)
+  func connectedSocketExchangesWithItsPeer(ioBackend: PThreadIOBackend, poolSize: Int) async throws {
+    try await PThreadTaskExecutor.withExecutor(name: "UDPSocketTest", poolSize: poolSize, ioBackend: ioBackend) {
+      executor in
+      try await withTaskExecutorPreference(executor) {
+        var server = try await UDPSocket.bind(to: Self.loopback)
+        var client = try await UDPSocket.connect(to: server.localAddress)
+
+        try await client.write(Array("ping".utf8))
+        let (request, requestSender) = try await server.receive(maxCount: 1024)
+        #expect(request == Array("ping".utf8))
+        #expect(requestSender == (try client.localAddress))
+
+        try await server.send(Array("pong".utf8), to: requestSender)
+        let reply = try await client.read(maxCount: 1024)
+        #expect(reply == Array("pong".utf8))
+
+        try await client.close()
+        try await server.close()
+      }
+    }
+  }
+
+  @Test(arguments: PThreadIOBackend.tested, [1, 4])
+  @available(anyAppleOS 27.0, *)
+  func withSplitReceivesWhileSending(ioBackend: PThreadIOBackend, poolSize: Int) async throws {
+    try await PThreadTaskExecutor.withExecutor(name: "UDPSocketTest", poolSize: poolSize, ioBackend: ioBackend) {
+      executor in
+      try await withTaskExecutorPreference(executor) {
+        try await withThrowingTaskGroup { group in
+          let bound = try await UDPSocket.bind(to: Self.loopback)
+          let serverAddress = try bound.localAddress
+          var serverBox: UDPSocket? = bound
+
+          // The server echoes one datagram.
+          group.addTask {
+            var server = serverBox.take()!
+            let (datagram, sender) = try await server.receive(maxCount: 1024)
+            try await server.send(datagram, to: sender)
+            try await server.close()
+          }
+
+          let client = try await UDPSocket.connect(to: serverAddress)
+          let payload = Array("Echo me".utf8)
+          let echoed = try await client.withSplit { receiveHalf, sendHalf in
+            let (echoed, _) = try await withConcurrently {
+              try await receiveHalf.read(maxCount: 1024)
+            } _: {
+              try await sendHalf.write(payload)
+            }
+            return echoed
+          }
+          try await client.close()
+          try await group.waitForAll()
+          #expect(echoed == payload)
+        }
+      }
+    }
+  }
+
   /// Sends a datagram to a socket, which sends a reply to the address it received the datagram from.
   @available(anyAppleOS 27.0, *)
   private static func exchange() async throws {
@@ -175,6 +236,29 @@ extension UDPSocket {
     return unsafe (Array(UnsafeRawBufferPointer(rebasing: buffer[..<count])), sender)
   }
 
+  /// Reads one datagram of at most `maxCount` bytes from the peer of a connected socket.
+  fileprivate mutating func read(maxCount: Int) async throws(IOError) -> [UInt8] {
+    let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: maxCount, alignment: 1)
+    defer {
+      unsafe buffer.deallocate()
+    }
+
+    var output = unsafe OutputRawSpan(buffer: buffer, initializedCount: 0)
+    let count = try await self.read(into: &output)
+    _ = unsafe output.finalize(for: buffer)
+    return unsafe Array(UnsafeRawBufferPointer(rebasing: buffer[..<count]))
+  }
+
+  /// Writes the bytes as one datagram to the peer of a connected socket.
+  fileprivate mutating func write(_ bytes: [UInt8]) async throws(IOError) {
+    let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: bytes.count, alignment: 1)
+    defer {
+      unsafe buffer.deallocate()
+    }
+    unsafe buffer.copyBytes(from: bytes)
+    try await unsafe self.write(from: RawSpan(_unsafeBytes: UnsafeRawBufferPointer(buffer)))
+  }
+
   /// Sends the bytes as one datagram.
   fileprivate mutating func send(_ bytes: [UInt8], to address: SocketAddress) async throws(IOError) {
     // The buffer has to stay alive while the send is in flight so we heap alloc here.
@@ -184,6 +268,34 @@ extension UDPSocket {
     }
     unsafe buffer.copyBytes(from: bytes)
     try await unsafe self.send(from: RawSpan(_unsafeBytes: UnsafeRawBufferPointer(buffer)), to: address)
+  }
+}
+@available(anyAppleOS 27.0, *)
+extension UDPSocket.ReceiveHalf {
+  /// Reads one datagram of at most `maxCount` bytes.
+  fileprivate mutating func read(maxCount: Int) async throws(IOError) -> [UInt8] {
+    let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: maxCount, alignment: 1)
+    defer {
+      unsafe buffer.deallocate()
+    }
+
+    var output = unsafe OutputRawSpan(buffer: buffer, initializedCount: 0)
+    let count = try await self.read(into: &output)
+    _ = unsafe output.finalize(for: buffer)
+    return unsafe Array(UnsafeRawBufferPointer(rebasing: buffer[..<count]))
+  }
+}
+
+@available(anyAppleOS 27.0, *)
+extension UDPSocket.SendHalf {
+  /// Writes the bytes as one datagram.
+  fileprivate mutating func write(_ bytes: [UInt8]) async throws(IOError) {
+    let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: bytes.count, alignment: 1)
+    defer {
+      unsafe buffer.deallocate()
+    }
+    unsafe buffer.copyBytes(from: bytes)
+    try await unsafe self.write(from: RawSpan(_unsafeBytes: UnsafeRawBufferPointer(buffer)))
   }
 }
 #endif

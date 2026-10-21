@@ -26,6 +26,10 @@ extension PThreadTaskExecutor: UDPSocketOperationScheduler {
     try await self.current().bind(to: address)
   }
 
+  public func connectUDP(to address: SocketAddress) async throws(IOError) -> UDPSocket {
+    try await self.current().connectUDP(to: address)
+  }
+
   public func receive(
     socket: borrowing UDPSocket,
     into buffer: inout OutputRawSpan
@@ -39,6 +43,14 @@ extension PThreadTaskExecutor: UDPSocketOperationScheduler {
     to address: SocketAddress
   ) async throws(IOError) -> Int {
     try await self.current().send(socket: socket, from: buffer, to: address)
+  }
+
+  public func read(socket: borrowing UDPSocket, into buffer: inout OutputRawSpan) async throws(IOError) -> Int {
+    try await self.current().read(socket: socket, into: &buffer)
+  }
+
+  public func write(socket: borrowing UDPSocket, from buffer: RawSpan) async throws(IOError) -> Int {
+    try await self.current().write(socket: socket, from: buffer)
   }
 
   public func close(socket: consuming UDPSocket) async throws(IOError) {
