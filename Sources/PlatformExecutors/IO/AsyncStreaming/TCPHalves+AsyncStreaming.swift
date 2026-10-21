@@ -16,17 +16,18 @@ public import BasicContainers
 public import ContainersPreview
 
 /// Heap memory that stays alive while a read is in flight.
+@safe
 final class IOScratchBuffer: @unchecked Sendable {
   static let defaultCapacity = 16 * 1024
 
   let pointer: UnsafeMutableRawBufferPointer
 
   init(capacity: Int = IOScratchBuffer.defaultCapacity) {
-    self.pointer = .allocate(byteCount: capacity, alignment: 16)
+    unsafe self.pointer = .allocate(byteCount: capacity, alignment: 16)
   }
 
   deinit {
-    self.pointer.deallocate()
+    unsafe self.pointer.deallocate()
   }
 }
 
@@ -102,11 +103,11 @@ extension TCPConnection.ReadHalf: AsyncReader {
     var buffer = self.asyncReadState.buffer.take() ?? UniqueArray<UInt8>()
     buffer.removeAll(keepingCapacity: true)
     if count > 0 {
-      let bytes = UnsafeBufferPointer(
+      let bytes = unsafe UnsafeBufferPointer(
         start: scratch.pointer.baseAddress!.assumingMemoryBound(to: UInt8.self),
         count: count
       )
-      buffer.append(copying: Span(_unsafeElements: bytes))
+      unsafe buffer.append(copying: Span(_unsafeElements: bytes))
     }
 
     do throws(Failure) {
@@ -135,7 +136,7 @@ extension TCPConnection.ReadHalf: CallerAsyncReader {
       return ()
     }
     for index in 0..<count {
-      buffer.append(scratch.pointer.load(fromByteOffset: index, as: UInt8.self))
+      unsafe buffer.append(scratch.pointer.load(fromByteOffset: index, as: UInt8.self))
     }
     return nil
   }

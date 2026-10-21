@@ -39,7 +39,7 @@ struct TCPAsyncStreamingTests {
             try await client(address)
           }
 
-          var server = try await listener.accept()
+          let server = try await listener.accept()
           try await server.withSplit { readHalf, writeHalf in
             var finished = false
             while !finished {
