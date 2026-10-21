@@ -38,28 +38,56 @@ private let sysAccept4 = unsafe CPlatformExecutors_accept4
 
 /// The non-blocking stream socket syscalls that back the TCP operations.
 enum StreamSocketSyscall {
+  /// The kind of socket to create.
+  enum SocketKind {
+    /// A TCP socket.
+    case stream
+
+    /// A UDP socket.
+    case datagram
+
+    fileprivate var type: CInt {
+      switch self {
+      case .stream: StreamSocketSyscall.streamSocketType
+      case .datagram: StreamSocketSyscall.datagramSocketType
+      }
+    }
+
+    fileprivate var protocolNumber: CInt {
+      switch self {
+      case .stream: CInt(IPPROTO_TCP)
+      case .datagram: CInt(IPPROTO_UDP)
+      }
+    }
+  }
+
   #if canImport(Glibc) && !os(Android)
   // Glibc imports the socket type and its flags as a C enum,
   // every other platform imports them as plain integers.
-  private static var streamSocketType: CInt { CInt(SOCK_STREAM.rawValue) }
+  fileprivate static var streamSocketType: CInt { CInt(SOCK_STREAM.rawValue) }
+  fileprivate static var datagramSocketType: CInt { CInt(SOCK_DGRAM.rawValue) }
   private static var nonBlockingFlag: CInt { CInt(SOCK_NONBLOCK.rawValue) }
   private static var closeOnExecFlag: CInt { CInt(SOCK_CLOEXEC.rawValue) }
   #elseif canImport(Darwin)
-  private static var streamSocketType: CInt { CInt(SOCK_STREAM) }
+  fileprivate static var streamSocketType: CInt { CInt(SOCK_STREAM) }
+  fileprivate static var datagramSocketType: CInt { CInt(SOCK_DGRAM) }
   #else
-  private static var streamSocketType: CInt { CInt(SOCK_STREAM) }
+  fileprivate static var streamSocketType: CInt { CInt(SOCK_STREAM) }
+  fileprivate static var datagramSocketType: CInt { CInt(SOCK_DGRAM) }
   private static var nonBlockingFlag: CInt { CInt(SOCK_NONBLOCK) }
   private static var closeOnExecFlag: CInt { CInt(SOCK_CLOEXEC) }
   #endif
 
-  /// Creates a new non-blocking TCP socket for the given address family.
+  /// Creates a new non-blocking socket for the given address family.
   ///
-  /// - Parameter family: The address family of the socket.
+  /// - Parameters:
+  ///   - family: The address family of the socket.
+  ///   - kind: The kind of socket to create.
   /// - Returns: The file descriptor of the new socket.
-  static func makeSocket(family: CInt) throws(IOError) -> CInt {
+  static func makeSocket(family: CInt, kind: SocketKind = .stream) throws(IOError) -> CInt {
     #if canImport(Darwin)
     let fileDescriptor = try retryingIOSyscall(blocking: false) {
-      socket(family, Self.streamSocketType, CInt(IPPROTO_TCP))
+      socket(family, kind.type, kind.protocolNumber)
     }.result
 
     do {
@@ -80,8 +108,8 @@ enum StreamSocketSyscall {
     return try retryingIOSyscall(blocking: false) {
       socket(
         family,
-        Self.streamSocketType | Self.nonBlockingFlag | Self.closeOnExecFlag,
-        CInt(IPPROTO_TCP)
+        kind.type | Self.nonBlockingFlag | Self.closeOnExecFlag,
+        kind.protocolNumber
       )
     }.result
     #endif

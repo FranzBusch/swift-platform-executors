@@ -185,6 +185,20 @@ struct ReadinessOperations: ~Copyable {
         return .failure(error)
       }
 
+    case .sendMessage(let socket, let message):
+      do {
+        return try unsafe DatagramSocketSyscall.sendMessage(socket, message).map { .success($0) }
+      } catch {
+        return .failure(error)
+      }
+
+    case .receiveMessage(let socket, let message):
+      do {
+        return try unsafe DatagramSocketSyscall.receiveMessage(socket, message).map { .success($0) }
+      } catch {
+        return .failure(error)
+      }
+
     case .shutdown(let socket, let direction):
       do {
         try StreamSocketSyscall.shutdown(socket, direction: direction)
@@ -232,9 +246,9 @@ struct ReadinessOperations: ~Copyable {
   /// The direction that an operation waits for.
   private static func direction(of operation: IOOperation) -> ReadinessInterest {
     switch unsafe operation {
-    case .connect, .write:
+    case .connect, .write, .sendMessage:
       return .write
-    case .accept, .read:
+    case .accept, .read, .receiveMessage:
       return .read
     case .shutdown, .close:
       // Neither waits for readiness.
@@ -278,7 +292,7 @@ struct ReadinessOperations: ~Copyable {
       }
       return nil
 
-    case .connect, .accept, .read, .write:
+    case .connect, .accept, .read, .write, .sendMessage, .receiveMessage:
       break
 
     case .openFile, .readFile, .writeFile:
